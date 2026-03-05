@@ -2,12 +2,7 @@
 
 import * as THREE from "three";
 import { Canvas, ThreeEvent, useFrame } from "@react-three/fiber";
-import {
-  OrbitControls,
-  GizmoHelper,
-  GizmoViewport,
-  ContactShadows,
-} from "@react-three/drei";
+import { OrbitControls, GizmoHelper, GizmoViewport, ContactShadows } from "@react-three/drei";
 import { EffectComposer, SSAO } from "@react-three/postprocessing";
 import { useEffect, useMemo, useRef, useState } from "react";
 
@@ -25,7 +20,11 @@ const HALF = GRID_SIZE / 2;
 const BUILD_HEIGHT = GRID_SIZE; // change to 40/64 etc if you want
 const EPS_PLANE = 0.002;
 
-// Camera presets (optional but nice)
+// History
+type Patch = { key: string; before: Voxel | null; after: Voxel | null };
+const HISTORY_LIMIT = 600;
+
+// Camera presets
 const CAM_TARGET = new THREE.Vector3(0, 0, 0);
 const CAM_ISO_POS = new THREE.Vector3(10, 10, 10);
 const CAM_FRONT_POS = new THREE.Vector3(0, 6, 14);
@@ -44,6 +43,34 @@ function BuildCage(props: { size: number; height: number }) {
       <mesh position={[0, cy, 0]}>
         <boxGeometry args={[size, height, size]} />
         <meshBasicMaterial wireframe transparent opacity={0.28} color="white" />
+      </mesh>
+    </group>
+  );
+}
+
+function CursorPreview(props: { cell: { x: number; y: number; z: number }; color: string }) {
+  const { cell, color } = props;
+  const outlineRef = useRef<THREE.Mesh>(null);
+
+  useFrame(({ clock }) => {
+    const m = outlineRef.current;
+    if (!m) return;
+    const s = 1.02 + Math.sin(clock.elapsedTime * 4) * 0.01;
+    m.scale.set(s, s, s);
+  });
+
+  return (
+    <group position={[cell.x + 0.5, cell.y + 0.5, cell.z + 0.5]}>
+      {/* faint fill */}
+      <mesh>
+        <boxGeometry args={[1, 1, 1]} />
+        <meshStandardMaterial transparent opacity={0.15} color={color} />
+      </mesh>
+
+      {/* pulsing outline */}
+      <mesh ref={outlineRef}>
+        <boxGeometry args={[1.02, 1.02, 1.02]} />
+        <meshBasicMaterial wireframe transparent opacity={0.9} color="white" />
       </mesh>
     </group>
   );
@@ -294,7 +321,6 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
   const { selectedColor, activeLayer } = props;
 
   const [voxels, setVoxels] = useState<Map<string, Voxel>>(() => new Map());
-
   const [hoverCell, setHoverCell] = useState<Cell>(null);
   const [hoveredVoxelKey, setHoveredVoxelKey] = useState<string | null>(null);
 
@@ -303,31 +329,79 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
   const snapToRef = useRef<THREE.Vector3 | null>(null);
   const snapTargetRef = useRef<THREE.Vector3>(CAM_TARGET.clone());
 
+  // History stacks
+  const undoRef = useRef<Patch[]>([]);
+  const redoRef = useRef<Patch[]>([]);
+  const [, bumpHistoryUI] = useState(0);
+
+  const canUndo = undoRef.current.length > 0;
+  const canRedo = redoRef.current.length > 0;
+
   const inBounds = (x: number, y: number, z: number) =>
-    x >= -HALF &&
-    x < HALF &&
-    z >= -HALF &&
-    z < HALF &&
-    y >= 0 &&
-    y < BUILD_HEIGHT;
+    x >= -HALF && x < HALF && z >= -HALF && z < HALF && y >= 0 && y < BUILD_HEIGHT;
+
+  const pushPatch = (patch: Patch) => {
+    undoRef.current.push(patch);
+    if (undoRef.current.length > HISTORY_LIMIT) undoRef.current.shift();
+    redoRef.current.length = 0;
+    bumpHistoryUI((v) => v + 1);
+  };
+
+  const applyPatch = (patch: Patch, dir: "undo" | "redo") => {
+    const value = dir === "redo" ? patch.after : patch.before;
+    setVoxels((prev) => {
+      const next = new Map(prev);
+      if (value) next.set(patch.key, value);
+      else next.delete(patch.key);
+      return next;
+    });
+  };
+
+  const undo = () => {
+    const patch = undoRef.current.pop();
+    if (!patch) return;
+    applyPatch(patch, "undo");
+    redoRef.current.push(patch);
+    bumpHistoryUI((v) => v + 1);
+  };
+
+  const redo = () => {
+    const patch = redoRef.current.pop();
+    if (!patch) return;
+    applyPatch(patch, "redo");
+    undoRef.current.push(patch);
+    bumpHistoryUI((v) => v + 1);
+  };
 
   const placeAt = (x: number, y: number, z: number) => {
     if (!inBounds(x, y, z)) return;
     const k = keyOf(x, y, z);
+
     setVoxels((prev) => {
       if (prev.has(k)) return prev;
+
       const next = new Map(prev);
-      next.set(k, { x, y, z, color: selectedColor });
+      const after: Voxel = { x, y, z, color: selectedColor };
+      next.set(k, after);
+
+      pushPatch({ key: k, before: null, after });
+
       return next;
     });
   };
 
   const removeAt = (x: number, y: number, z: number) => {
     const k = keyOf(x, y, z);
+
     setVoxels((prev) => {
-      if (!prev.has(k)) return prev;
+      const before = prev.get(k);
+      if (!before) return prev;
+
       const next = new Map(prev);
       next.delete(k);
+
+      pushPatch({ key: k, before, after: null });
+
       return next;
     });
   };
@@ -394,7 +468,6 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
       const x = clamp(Math.floor(p.x), -HALF, HALF - 1);
       return { x, y, z: HALF - 1 };
     }
-    // "-Z"
     const x = clamp(Math.floor(p.x), -HALF, HALF - 1);
     return { x, y, z: -HALF };
   };
@@ -509,12 +582,31 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
     return voxels.get(hoveredVoxelKey) ?? null;
   }, [hoveredVoxelKey, voxels]);
 
-  // Snap hotkeys
+  // Hotkeys: views + undo/redo
   useEffect(() => {
     const onKeyDown = (ev: KeyboardEvent) => {
       const t = ev.target as HTMLElement | null;
       const tag = t?.tagName?.toLowerCase();
       if (tag === "input" || tag === "textarea" || (t as any)?.isContentEditable) return;
+
+      const isMac = navigator.platform.toLowerCase().includes("mac");
+      const mod = isMac ? ev.metaKey : ev.ctrlKey;
+
+      if (mod) {
+        const k = ev.key.toLowerCase();
+
+        if (k === "z" && !ev.shiftKey) {
+          ev.preventDefault();
+          undo();
+          return;
+        }
+
+        if ((k === "z" && ev.shiftKey) || k === "y") {
+          ev.preventDefault();
+          redo();
+          return;
+        }
+      }
 
       if (ev.key === "1") snapToRef.current = CAM_FRONT_POS.clone();
       if (ev.key === "2") snapToRef.current = CAM_RIGHT_POS.clone();
@@ -544,7 +636,7 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
           top: 12,
           right: 12,
           zIndex: 60,
-          padding: "8px 10px",
+          padding: "10px 10px",
           borderRadius: 12,
           background: "rgba(15, 15, 18, 0.85)",
           border: "1px solid rgba(255,255,255,0.12)",
@@ -554,12 +646,53 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
             "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
           boxShadow: "0 10px 30px rgba(0,0,0,0.35)",
           backdropFilter: "blur(10px)",
-          pointerEvents: "none",
+          pointerEvents: "auto",
           lineHeight: 1.35,
         }}
       >
-        <div>Voxels: {voxels.size}</div>
-        <div style={{ opacity: 0.75 }}>Views: 1 Front · 2 Right · 3 Top · 4 Iso</div>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+          <div>
+            <div>Voxels: {voxels.size}</div>
+            <div style={{ opacity: 0.75 }}>Views: 1 Front · 2 Right · 3 Top · 4 Iso</div>
+            <div style={{ opacity: 0.7 }}>Undo: Ctrl/Cmd+Z · Redo: Ctrl/Cmd+Y / Shift+Z</div>
+          </div>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <button
+              onClick={undo}
+              disabled={!canUndo}
+              style={{
+                padding: "6px 10px",
+                borderRadius: 10,
+                border: "1px solid rgba(255,255,255,0.16)",
+                background: canUndo ? "rgba(255,255,255,0.08)" : "rgba(255,255,255,0.03)",
+                color: "white",
+                cursor: canUndo ? "pointer" : "not-allowed",
+                fontSize: 12,
+              }}
+              title="Undo (Ctrl/Cmd+Z)"
+            >
+              Undo
+            </button>
+
+            <button
+              onClick={redo}
+              disabled={!canRedo}
+              style={{
+                padding: "6px 10px",
+                borderRadius: 10,
+                border: "1px solid rgba(255,255,255,0.16)",
+                background: canRedo ? "rgba(255,255,255,0.08)" : "rgba(255,255,255,0.03)",
+                color: "white",
+                cursor: canRedo ? "pointer" : "not-allowed",
+                fontSize: 12,
+              }}
+              title="Redo (Ctrl/Cmd+Y or Ctrl/Cmd+Shift+Z)"
+            >
+              Redo
+            </button>
+          </div>
+        </div>
       </div>
 
       <Canvas
@@ -664,13 +797,8 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
           <meshBasicMaterial transparent opacity={0} />
         </mesh>
 
-        {/* Hover preview cube */}
-        {showHover && hoverCell && (
-          <mesh position={[hoverCell.x + 0.5, hoverCell.y + 0.5, hoverCell.z + 0.5]}>
-            <boxGeometry args={[1, 1, 1]} />
-            <meshStandardMaterial transparent opacity={0.35} color={selectedColor} />
-          </mesh>
-        )}
+        {/* Cursor preview */}
+        {showHover && hoverCell && <CursorPreview cell={hoverCell} color={selectedColor} />}
 
         {/* Greedy meshed surface (single mesh) */}
         <mesh
@@ -693,13 +821,15 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
         )}
 
         {/* Post-processing AO */}
-<EffectComposer enableNormalPass>
-  <SSAO samples={8} radius={0.18} intensity={10} luminanceInfluence={0.7} />
-</EffectComposer>
+        <EffectComposer enableNormalPass>
+          <SSAO samples={8} radius={0.18} intensity={10} luminanceInfluence={0.7} />
+        </EffectComposer>
 
-<GizmoHelper alignment="bottom-right" margin={[80, 80]} renderPriority={2}>
-  <GizmoViewport axisColors={["#ff3653", "#8adb00", "#2c8fff"]} labelColor="white" />
-</GizmoHelper>
+        {/* Gizmo axis widget (rendered after postprocessing) */}
+        <GizmoHelper alignment="bottom-right" margin={[80, 80]} renderPriority={2}>
+          <GizmoViewport axisColors={["#ff3653", "#8adb00", "#2c8fff"]} labelColor="white" />
+        </GizmoHelper>
+
         {/* Controls */}
         <OrbitControls
           ref={controlsRef}
