@@ -22,7 +22,11 @@ const EPS_PLANE = 0.002;
 
 // History
 type Patch = { key: string; before: Voxel | null; after: Voxel | null };
+type HistoryEntry = { kind: "single"; patch: Patch } | { kind: "batch"; patches: Patch[] };
 const HISTORY_LIMIT = 600;
+
+// Drawing tools
+type Tool = "single" | "draw" | "paint" | "erase";
 
 // Camera presets
 const CAM_TARGET = new THREE.Vector3(0, 0, 0);
@@ -61,13 +65,11 @@ function CursorPreview(props: { cell: { x: number; y: number; z: number }; color
 
   return (
     <group position={[cell.x + 0.5, cell.y + 0.5, cell.z + 0.5]}>
-      {/* faint fill */}
       <mesh>
         <boxGeometry args={[1, 1, 1]} />
         <meshStandardMaterial transparent opacity={0.15} color={color} />
       </mesh>
 
-      {/* pulsing outline */}
       <mesh ref={outlineRef}>
         <boxGeometry args={[1.02, 1.02, 1.02]} />
         <meshBasicMaterial wireframe transparent opacity={0.9} color="white" />
@@ -140,7 +142,6 @@ function buildGreedyGeometry(voxels: Map<string, Voxel>) {
     return g;
   }
 
-  // Bounds for the build volume
   const minX = -HALF;
   const maxX = HALF - 1;
   const minZ = -HALF;
@@ -149,9 +150,9 @@ function buildGreedyGeometry(voxels: Map<string, Voxel>) {
   const maxY = BUILD_HEIGHT - 1;
 
   const dims = [
-    maxX - minX + 1, // X count
-    maxY - minY + 1, // Y count
-    maxZ - minZ + 1, // Z count
+    maxX - minX + 1, // X
+    maxY - minY + 1, // Y
+    maxZ - minZ + 1, // Z
   ] as const;
 
   const hasVoxel = (x: number, y: number, z: number) => voxels.has(keyOf(x, y, z));
@@ -287,6 +288,35 @@ function buildGreedyGeometry(voxels: Map<string, Voxel>) {
   return geom;
 }
 
+function rasterLine(a: { x: number; y: number; z: number }, b: { x: number; y: number; z: number }) {
+  const pts: { x: number; y: number; z: number }[] = [];
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const dz = b.z - a.z;
+
+  const steps = Math.max(Math.abs(dx), Math.abs(dy), Math.abs(dz));
+  if (steps === 0) return [a];
+
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    pts.push({
+      x: Math.round(a.x + dx * t),
+      y: Math.round(a.y + dy * t),
+      z: Math.round(a.z + dz * t),
+    });
+  }
+
+  // de-dupe consecutive
+  const out: typeof pts = [];
+  let last = "";
+  for (const p of pts) {
+    const k = `${p.x},${p.y},${p.z}`;
+    if (k !== last) out.push(p);
+    last = k;
+  }
+  return out;
+}
+
 function SnapDriver(props: {
   controlsRef: React.RefObject<any>;
   snapToRef: React.MutableRefObject<THREE.Vector3 | null>;
@@ -324,56 +354,123 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
   const [hoverCell, setHoverCell] = useState<Cell>(null);
   const [hoveredVoxelKey, setHoveredVoxelKey] = useState<string | null>(null);
 
+  // Tool
+  const [tool, setTool] = useState<Tool>("single");
+
   // Camera controls
   const controlsRef = useRef<any>(null);
   const snapToRef = useRef<THREE.Vector3 | null>(null);
   const snapTargetRef = useRef<THREE.Vector3>(CAM_TARGET.clone());
 
   // History stacks
-  const undoRef = useRef<Patch[]>([]);
-  const redoRef = useRef<Patch[]>([]);
+  const undoRef = useRef<HistoryEntry[]>([]);
+  const redoRef = useRef<HistoryEntry[]>([]);
   const [, bumpHistoryUI] = useState(0);
 
   const canUndo = undoRef.current.length > 0;
   const canRedo = redoRef.current.length > 0;
 
+  // Drawing stroke state
+  const drawingRef = useRef(false);
+  const strokePatchesRef = useRef<Map<string, Patch>>(new Map());
+  const lastCellRef = useRef<Cell>(null);
+  const lastStampRef = useRef(0);
+
   const inBounds = (x: number, y: number, z: number) =>
     x >= -HALF && x < HALF && z >= -HALF && z < HALF && y >= 0 && y < BUILD_HEIGHT;
 
-  const pushPatch = (patch: Patch) => {
-    undoRef.current.push(patch);
+  const pushEntry = (entry: HistoryEntry) => {
+    undoRef.current.push(entry);
     if (undoRef.current.length > HISTORY_LIMIT) undoRef.current.shift();
     redoRef.current.length = 0;
     bumpHistoryUI((v) => v + 1);
   };
 
-  const applyPatch = (patch: Patch, dir: "undo" | "redo") => {
+  const applySinglePatch = (patch: Patch, dir: "undo" | "redo", base: Map<string, Voxel>) => {
     const value = dir === "redo" ? patch.after : patch.before;
+    if (value) base.set(patch.key, value);
+    else base.delete(patch.key);
+  };
+
+  const applyEntry = (entry: HistoryEntry, dir: "undo" | "redo") => {
     setVoxels((prev) => {
       const next = new Map(prev);
-      if (value) next.set(patch.key, value);
-      else next.delete(patch.key);
+      if (entry.kind === "single") {
+        applySinglePatch(entry.patch, dir, next);
+      } else {
+        const patches = dir === "undo" ? [...entry.patches].reverse() : entry.patches;
+        for (const p of patches) applySinglePatch(p, dir, next);
+      }
       return next;
     });
   };
 
   const undo = () => {
-    const patch = undoRef.current.pop();
-    if (!patch) return;
-    applyPatch(patch, "undo");
-    redoRef.current.push(patch);
+    const entry = undoRef.current.pop();
+    if (!entry) return;
+    applyEntry(entry, "undo");
+    redoRef.current.push(entry);
     bumpHistoryUI((v) => v + 1);
   };
 
   const redo = () => {
-    const patch = redoRef.current.pop();
-    if (!patch) return;
-    applyPatch(patch, "redo");
-    undoRef.current.push(patch);
+    const entry = redoRef.current.pop();
+    if (!entry) return;
+    applyEntry(entry, "redo");
+    undoRef.current.push(entry);
     bumpHistoryUI((v) => v + 1);
   };
 
-  const placeAt = (x: number, y: number, z: number) => {
+  const commitStroke = () => {
+    const patches = Array.from(strokePatchesRef.current.values());
+    strokePatchesRef.current.clear();
+    if (patches.length === 0) return;
+    pushEntry({ kind: "batch", patches });
+  };
+
+  const beginStroke = () => {
+    strokePatchesRef.current.clear();
+    lastCellRef.current = null;
+    lastStampRef.current = 0;
+  };
+
+  const applyToolAt = (cell: { x: number; y: number; z: number }) => {
+    if (!inBounds(cell.x, cell.y, cell.z)) return;
+    const k = keyOf(cell.x, cell.y, cell.z);
+
+    setVoxels((prev) => {
+      const next = new Map(prev);
+      const existing = next.get(k) ?? null;
+
+      if (tool === "draw") {
+        if (existing) return prev;
+        const after: Voxel = { x: cell.x, y: cell.y, z: cell.z, color: selectedColor };
+        next.set(k, after);
+        strokePatchesRef.current.set(k, { key: k, before: null, after });
+        return next;
+      }
+
+      if (tool === "erase") {
+        if (!existing) return prev;
+        next.delete(k);
+        strokePatchesRef.current.set(k, { key: k, before: existing, after: null });
+        return next;
+      }
+
+      if (tool === "paint") {
+        if (!existing) return prev;
+        if (existing.color === selectedColor) return prev;
+        const after: Voxel = { ...existing, color: selectedColor };
+        next.set(k, after);
+        strokePatchesRef.current.set(k, { key: k, before: existing, after });
+        return next;
+      }
+
+      return prev;
+    });
+  };
+
+  const placeAtSingle = (x: number, y: number, z: number) => {
     if (!inBounds(x, y, z)) return;
     const k = keyOf(x, y, z);
 
@@ -384,13 +481,13 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
       const after: Voxel = { x, y, z, color: selectedColor };
       next.set(k, after);
 
-      pushPatch({ key: k, before: null, after });
+      pushEntry({ kind: "single", patch: { key: k, before: null, after } });
 
       return next;
     });
   };
 
-  const removeAt = (x: number, y: number, z: number) => {
+  const removeAtSingle = (x: number, y: number, z: number) => {
     const k = keyOf(x, y, z);
 
     setVoxels((prev) => {
@@ -400,7 +497,7 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
       const next = new Map(prev);
       next.delete(k);
 
-      pushPatch({ key: k, before, after: null });
+      pushEntry({ kind: "single", patch: { key: k, before, after: null } });
 
       return next;
     });
@@ -416,6 +513,75 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
     return ok ? hit : null;
   };
 
+  // Hover setter that also draws if dragging
+  const setHoverAndMaybeDraw = (c: Cell) => {
+    setHoverCell(c);
+    if (!c) return;
+    if (!drawingRef.current) return;
+    if (tool === "single") return;
+
+    // throttle ~60fps
+    const now = performance.now();
+    if (now - lastStampRef.current < 16) return;
+    lastStampRef.current = now;
+
+    const last = lastCellRef.current;
+    if (!last) {
+      applyToolAt(c);
+      lastCellRef.current = c;
+      return;
+    }
+
+const manhattanJump =
+    Math.abs(c.x - last.x) + Math.abs(c.y - last.y) + Math.abs(c.z - last.z);
+
+  // If hover jumped a lot (camera seam / ray jump), DON'T fill a huge line.
+  if (manhattanJump > 6) {
+    applyToolAt(c);
+    lastCellRef.current = c;
+    return;
+  }
+
+    const pts = rasterLine(last, c);
+    for (const p of pts) applyToolAt(p);
+    lastCellRef.current = c;
+  };
+
+const onPointerDownDraw = (e: ThreeEvent<PointerEvent>) => {
+  if (tool === "single") return;
+  e.stopPropagation();
+
+  // pointer capture helps keep dragging reliable
+  (e.target as any)?.setPointerCapture?.((e as any).pointerId);
+
+  drawingRef.current = true;
+  beginStroke();
+
+  const startCell =
+    tool === "paint" || tool === "erase"
+      ? (hitVoxelCellRef.current ?? hoverCell)
+      : hoverCell;
+
+  if (startCell) {
+    applyToolAt(startCell);
+    lastCellRef.current = startCell;
+  }
+};
+
+  const onPointerUpDraw = () => {
+    if (!drawingRef.current) return;
+    drawingRef.current = false;
+    lastCellRef.current = null;
+    commitStroke();
+  };
+
+  // Ensure we commit even if mouse is released outside the canvas
+  useEffect(() => {
+    const up = () => onPointerUpDraw();
+    window.addEventListener("pointerup", up);
+    return () => window.removeEventListener("pointerup", up);
+  }, []);
+
   // --- Active layer plane handlers ---
   const handlePickPlaneMove = (e: ThreeEvent<PointerEvent>) => {
     e.stopPropagation();
@@ -425,23 +591,26 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
     const y = activeLayer;
 
     if (!inBounds(x, y, z)) {
-      setHoverCell(null);
+      setHoverAndMaybeDraw(null);
       return;
     }
 
-    setHoverCell((prev) => (prev && prev.x === x && prev.y === y && prev.z === z ? prev : { x, y, z }));
+    setHoverAndMaybeDraw({ x, y, z });
   };
 
-  const handlePickPlaneLeave = () => setHoverCell(null);
+  const handlePickPlaneLeave = () => setHoverAndMaybeDraw(null);
 
   const handlePickPlaneClick = (e: ThreeEvent<MouseEvent>) => {
     e.stopPropagation();
-    if (e.shiftKey) return;
 
+    // If in drag tools, click is handled by pointer down (stroke). Ignore click.
+    if (tool !== "single") return;
+
+    if (e.shiftKey) return;
     const p = e.point;
     const x = Math.floor(p.x);
     const z = Math.floor(p.z);
-    placeAt(x, activeLayer, z);
+    placeAtSingle(x, activeLayer, z);
   };
 
   // --- Bounds plane helpers (MagicaVoxel cage placement) ---
@@ -475,71 +644,87 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
   const handleBoundsPlaneMove = (plane: BoundsPlane) => (e: ThreeEvent<PointerEvent>) => {
     e.stopPropagation();
     const c = cellFromBoundsPlane(plane, e.point);
-    setHoverCell((prev) => (prev && prev.x === c.x && prev.y === c.y && prev.z === c.z ? prev : c));
+    setHoverAndMaybeDraw(c);
   };
 
-  const handleBoundsPlaneLeave = () => setHoverCell(null);
+  const handleBoundsPlaneLeave = () => setHoverAndMaybeDraw(null);
 
   const handleBoundsPlaneClick = (plane: BoundsPlane) => (e: ThreeEvent<MouseEvent>) => {
     e.stopPropagation();
+
+    if (tool !== "single") return;
+
     if (e.shiftKey) return;
     const c = cellFromBoundsPlane(plane, e.point);
-    placeAt(c.x, c.y, c.z);
+    placeAtSingle(c.x, c.y, c.z);
   };
+
+  const hitVoxelCellRef = useRef<Cell>(null);
 
   // --- Surface mesh hover/click (adjacent placement + delete) ---
   const handleSurfacePointerMove = (e: ThreeEvent<PointerEvent>) => {
     e.stopPropagation();
 
-    const n = e.face?.normal;
-    if (!n) return;
+  const n = e.face?.normal;
+  if (!n) return;
 
-    const hitVoxel = voxelFromHit(e.point, n);
-    const hitKey = keyOf(hitVoxel.x, hitVoxel.y, hitVoxel.z);
-    if (!voxels.has(hitKey)) return;
+  const hitVoxel = voxelFromHit(e.point, n);
+  const hitKey = keyOf(hitVoxel.x, hitVoxel.y, hitVoxel.z);
+  if (!voxels.has(hitKey)) return;
 
-    setHoveredVoxelKey(hitKey);
+  setHoveredVoxelKey(hitKey);
+  hitVoxelCellRef.current = hitVoxel; // <-- important
 
-    const allowFace = hitVoxel.y === activeLayer || e.altKey;
+  const allowFace = hitVoxel.y === activeLayer || e.altKey;
 
-    if (!allowFace) {
-      const hit = intersectBuildPlane(e.ray);
-      if (!hit) return;
-      const x = Math.floor(hit.x);
-      const z = Math.floor(hit.z);
-      const y = activeLayer;
+  // If tool is paint/erase, we want to target the HIT voxel itself
+  if (tool === "paint" || tool === "erase") {
+    setHoverAndMaybeDraw(hitVoxel);
+    return;
+  }
 
-      if (!inBounds(x, y, z)) {
-        setHoverCell(null);
-        return;
-      }
-      setHoverCell((prev) => (prev && prev.x === x && prev.y === y && prev.z === z ? prev : { x, y, z }));
+  // Otherwise (single/draw), we want to target the adjacent placement cell
+  if (!allowFace) {
+    const hit = intersectBuildPlane(e.ray);
+    if (!hit) return;
+
+    const x = Math.floor(hit.x);
+    const z = Math.floor(hit.z);
+    const y = activeLayer;
+
+    if (!inBounds(x, y, z)) {
+      setHoverAndMaybeDraw(null);
       return;
     }
 
-    const dx = Math.round(n.x);
-    const dy = Math.round(n.y);
-    const dz = Math.round(n.z);
+    setHoverAndMaybeDraw({ x, y, z });
+    return;
+  }
 
-    const target = { x: hitVoxel.x + dx, y: hitVoxel.y + dy, z: hitVoxel.z + dz };
+  const dx = Math.round(n.x);
+  const dy = Math.round(n.y);
+  const dz = Math.round(n.z);
 
-    if (!inBounds(target.x, target.y, target.z)) {
-      setHoverCell(null);
-      return;
-    }
+  const target = { x: hitVoxel.x + dx, y: hitVoxel.y + dy, z: hitVoxel.z + dz };
 
-    setHoverCell((prev) =>
-      prev && prev.x === target.x && prev.y === target.y && prev.z === target.z ? prev : target
-    );
-  };
+  if (!inBounds(target.x, target.y, target.z)) {
+    setHoverAndMaybeDraw(null);
+    return;
+  }
 
-  const handleSurfacePointerOut = (e: ThreeEvent<PointerEvent>) => {
-    e.stopPropagation();
-    setHoveredVoxelKey(null);
-  };
+  setHoverAndMaybeDraw(target);
+};
+
+const handleSurfacePointerOut = (e: ThreeEvent<PointerEvent>) => {
+  e.stopPropagation();
+  setHoveredVoxelKey(null);
+  hitVoxelCellRef.current = null;
+};
 
   const handleSurfaceClick = (e: ThreeEvent<MouseEvent>) => {
     e.stopPropagation();
+
+    if (tool !== "single") return;
 
     const n = e.face?.normal;
     if (!n) return;
@@ -549,18 +734,18 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
     if (!voxels.has(hitKey)) return;
 
     if (e.shiftKey) {
-      removeAt(hitVoxel.x, hitVoxel.y, hitVoxel.z);
+      removeAtSingle(hitVoxel.x, hitVoxel.y, hitVoxel.z);
       return;
     }
 
-    const allowFace = hitVoxel.y === activeLayer || e.altKey;
+    const allowFace = hitVoxel.y === activeLayer || (e as any).altKey;
 
     if (!allowFace) {
       const hit = intersectBuildPlane(e.ray);
       if (!hit) return;
       const x = Math.floor(hit.x);
       const z = Math.floor(hit.z);
-      placeAt(x, activeLayer, z);
+      placeAtSingle(x, activeLayer, z);
       return;
     }
 
@@ -568,21 +753,28 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
     const dy = Math.round(n.y);
     const dz = Math.round(n.z);
 
-    placeAt(hitVoxel.x + dx, hitVoxel.y + dy, hitVoxel.z + dz);
+    placeAtSingle(hitVoxel.x + dx, hitVoxel.y + dy, hitVoxel.z + dz);
   };
 
   // Hover preview cell validity
-  const showHover =
-    hoverCell !== null &&
-    inBounds(hoverCell.x, hoverCell.y, hoverCell.z) &&
-    !voxels.has(keyOf(hoverCell.x, hoverCell.y, hoverCell.z));
+const showHover = useMemo(() => {
+  if (!hoverCell) return false;
+  if (!inBounds(hoverCell.x, hoverCell.y, hoverCell.z)) return false;
+
+  const occupied = voxels.has(keyOf(hoverCell.x, hoverCell.y, hoverCell.z));
+
+  if (tool === "draw") return !occupied;      // show where you'd place
+  if (tool === "paint") return occupied;      // show only on existing
+  if (tool === "erase") return occupied;      // show only on existing
+  return !occupied;                           // single: place preview
+}, [hoverCell, voxels, tool]);
 
   const hoveredVoxel = useMemo(() => {
     if (!hoveredVoxelKey) return null;
     return voxels.get(hoveredVoxelKey) ?? null;
   }, [hoveredVoxelKey, voxels]);
 
-  // Hotkeys: views + undo/redo
+  // Hotkeys: views + undo/redo + tools
   useEffect(() => {
     const onKeyDown = (ev: KeyboardEvent) => {
       const t = ev.target as HTMLElement | null;
@@ -608,6 +800,13 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
         }
       }
 
+      // tools
+      if (ev.key.toLowerCase() === "b") setTool("draw");
+      if (ev.key.toLowerCase() === "p") setTool("paint");
+      if (ev.key.toLowerCase() === "e") setTool("erase");
+      if (ev.key.toLowerCase() === "v") setTool("single");
+
+      // camera views
       if (ev.key === "1") snapToRef.current = CAM_FRONT_POS.clone();
       if (ev.key === "2") snapToRef.current = CAM_RIGHT_POS.clone();
       if (ev.key === "3") snapToRef.current = CAM_TOP_POS.clone();
@@ -648,6 +847,8 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
           backdropFilter: "blur(10px)",
           pointerEvents: "auto",
           lineHeight: 1.35,
+          width: 330,
+          maxWidth: "calc(100vw - 24px)",
         }}
       >
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
@@ -655,6 +856,7 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
             <div>Voxels: {voxels.size}</div>
             <div style={{ opacity: 0.75 }}>Views: 1 Front · 2 Right · 3 Top · 4 Iso</div>
             <div style={{ opacity: 0.7 }}>Undo: Ctrl/Cmd+Z · Redo: Ctrl/Cmd+Y / Shift+Z</div>
+            <div style={{ opacity: 0.7 }}>Tools: V(single) · B(draw) · P(paint) · E(erase)</div>
           </div>
 
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
@@ -693,6 +895,36 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
             </button>
           </div>
         </div>
+
+        <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap" }}>
+          {(["single", "draw", "paint", "erase"] as const).map((t) => (
+            <button
+              key={t}
+              onClick={() => setTool(t)}
+              style={{
+                padding: "6px 10px",
+                borderRadius: 10,
+                border: "1px solid rgba(255,255,255,0.16)",
+                background: tool === t ? "rgba(255,255,255,0.14)" : "rgba(255,255,255,0.06)",
+                color: "white",
+                cursor: "pointer",
+                fontSize: 12,
+                textTransform: "capitalize",
+              }}
+              title={
+                t === "draw"
+                  ? "Free-draw (place while dragging)"
+                  : t === "paint"
+                  ? "Paint existing voxels (drag)"
+                  : t === "erase"
+                  ? "Erase voxels (drag)"
+                  : "Single click behavior"
+              }
+            >
+              {t}
+            </button>
+          ))}
+        </div>
       </div>
 
       <Canvas
@@ -730,6 +962,7 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
           position={[0, activeLayer, 0]}
           onPointerMove={handlePickPlaneMove}
           onPointerOut={handlePickPlaneLeave}
+          onPointerDown={onPointerDownDraw}
           onClick={handlePickPlaneClick}
         >
           <planeGeometry args={[GRID_SIZE, GRID_SIZE]} />
@@ -743,6 +976,7 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
           position={[0, BUILD_HEIGHT + EPS_PLANE, 0]}
           onPointerMove={handleBoundsPlaneMove("TOP")}
           onPointerOut={handleBoundsPlaneLeave}
+          onPointerDown={onPointerDownDraw}
           onClick={handleBoundsPlaneClick("TOP")}
         >
           <planeGeometry args={[GRID_SIZE, GRID_SIZE]} />
@@ -755,6 +989,7 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
           position={[HALF + EPS_PLANE, BUILD_HEIGHT / 2, 0]}
           onPointerMove={handleBoundsPlaneMove("+X")}
           onPointerOut={handleBoundsPlaneLeave}
+          onPointerDown={onPointerDownDraw}
           onClick={handleBoundsPlaneClick("+X")}
         >
           <planeGeometry args={[GRID_SIZE, BUILD_HEIGHT]} />
@@ -767,6 +1002,7 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
           position={[-HALF - EPS_PLANE, BUILD_HEIGHT / 2, 0]}
           onPointerMove={handleBoundsPlaneMove("-X")}
           onPointerOut={handleBoundsPlaneLeave}
+          onPointerDown={onPointerDownDraw}
           onClick={handleBoundsPlaneClick("-X")}
         >
           <planeGeometry args={[GRID_SIZE, BUILD_HEIGHT]} />
@@ -779,6 +1015,7 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
           position={[0, BUILD_HEIGHT / 2, HALF + EPS_PLANE]}
           onPointerMove={handleBoundsPlaneMove("+Z")}
           onPointerOut={handleBoundsPlaneLeave}
+          onPointerDown={onPointerDownDraw}
           onClick={handleBoundsPlaneClick("+Z")}
         >
           <planeGeometry args={[GRID_SIZE, BUILD_HEIGHT]} />
@@ -791,6 +1028,7 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
           position={[0, BUILD_HEIGHT / 2, -HALF - EPS_PLANE]}
           onPointerMove={handleBoundsPlaneMove("-Z")}
           onPointerOut={handleBoundsPlaneLeave}
+          onPointerDown={onPointerDownDraw}
           onClick={handleBoundsPlaneClick("-Z")}
         >
           <planeGeometry args={[GRID_SIZE, BUILD_HEIGHT]} />
@@ -807,6 +1045,7 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
           receiveShadow
           onPointerMove={handleSurfacePointerMove}
           onPointerOut={handleSurfacePointerOut}
+          onPointerDown={onPointerDownDraw}
           onClick={handleSurfaceClick}
         >
           <meshStandardMaterial vertexColors roughness={0.7} metalness={0.0} />
