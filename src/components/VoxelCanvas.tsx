@@ -21,6 +21,10 @@ function keyOf(x: number, y: number, z: number) {
 const GRID_SIZE = 20;
 const HALF = GRID_SIZE / 2;
 
+// MagicaVoxel-like build volume
+const BUILD_HEIGHT = GRID_SIZE; // change to 40/64 etc if you want
+const EPS_PLANE = 0.002;
+
 // Camera presets (optional but nice)
 const CAM_TARGET = new THREE.Vector3(0, 0, 0);
 const CAM_ISO_POS = new THREE.Vector3(10, 10, 10);
@@ -29,12 +33,25 @@ const CAM_RIGHT_POS = new THREE.Vector3(14, 6, 0);
 const CAM_TOP_POS = new THREE.Vector3(0, 18, 0.001);
 const CAM_LERP = 0.18;
 
+type BoundsPlane = "+X" | "-X" | "+Z" | "-Z" | "TOP";
+
+function BuildCage(props: { size: number; height: number }) {
+  const { size, height } = props;
+  const cy = height / 2;
+
+  return (
+    <group raycast={() => null}>
+      <mesh position={[0, cy, 0]}>
+        <boxGeometry args={[size, height, size]} />
+        <meshBasicMaterial wireframe transparent opacity={0.28} color="white" />
+      </mesh>
+    </group>
+  );
+}
+
 /**
  * Convert a raycast hit (point + face normal) into the voxel coordinate
- * that owns that face.
- *
- * This works even when faces are merged (greedy meshing) because the hit point
- * is still on the face plane, and the normal tells us which side is solid.
+ * that owns that face (works even when faces are merged).
  */
 function voxelFromHit(point: THREE.Vector3, normal: THREE.Vector3) {
   const eps = 1e-4;
@@ -47,7 +64,6 @@ function voxelFromHit(point: THREE.Vector3, normal: THREE.Vector3) {
     y = 0,
     z = 0;
 
-  // For the axis aligned with the normal, offset slightly toward the solid voxel
   if (nx === 1) x = Math.floor(point.x - eps);
   else if (nx === -1) x = Math.floor(point.x + eps);
   else x = Math.floor(point.x);
@@ -61,222 +77,6 @@ function voxelFromHit(point: THREE.Vector3, normal: THREE.Vector3) {
   else z = Math.floor(point.z);
 
   return { x, y, z };
-}
-
-/**
- * Greedy meshing for a sparse voxel map (axis-aligned unit cubes).
- * Merges adjacent faces ONLY if they share the same color.
- *
- * Output geometry has:
- * - position (vec3)
- * - normal (vec3)
- * - color (vec3)  (vertexColors)
- */
-function buildGreedyGeometry(voxels: Map<string, Voxel>) {
-  const positions: number[] = [];
-  const normals: number[] = [];
-  const colors: number[] = [];
-
-  if (voxels.size === 0) {
-    const g = new THREE.BufferGeometry();
-    g.setAttribute("position", new THREE.Float32BufferAttribute([], 3));
-    g.setAttribute("normal", new THREE.Float32BufferAttribute([], 3));
-    g.setAttribute("color", new THREE.Float32BufferAttribute([], 3));
-    return g;
-  }
-
-  // Bounds:
-  // x/z are bounded by the grid. y is bounded by existing voxels (plus a small margin).
-  let minY = Infinity;
-  let maxY = -Infinity;
-
-  for (const v of voxels.values()) {
-    if (v.y < minY) minY = v.y;
-    if (v.y > maxY) maxY = v.y;
-  }
-
-  // Add a little margin so top/bottom faces mesh cleanly
-  minY -= 1;
-  maxY += 1;
-
-  const minX = -HALF;
-  const maxX = HALF - 1;
-  const minZ = -HALF;
-  const maxZ = HALF - 1;
-
-  // Dimension sizes (# of voxel columns)
-  const dims = [
-    maxX - minX + 1,
-    maxY - minY + 1,
-    maxZ - minZ + 1,
-  ] as const;
-
-  // Helper lookups (sparse map)
-  const getVoxel = (x: number, y: number, z: number) => voxels.get(keyOf(x, y, z));
-  const hasVoxel = (x: number, y: number, z: number) => voxels.has(keyOf(x, y, z));
-
-  // Cache colors (string -> THREE.Color components)
-  const colorCache = new Map<string, [number, number, number]>();
-  const getColorRGB = (hex: string): [number, number, number] => {
-    const cached = colorCache.get(hex);
-    if (cached) return cached;
-    const c = new THREE.Color(hex);
-    const rgb: [number, number, number] = [c.r, c.g, c.b];
-    colorCache.set(hex, rgb);
-    return rgb;
-  };
-
-  // Standard greedy meshing sweep
-  // d = axis of sweep (0=X,1=Y,2=Z)
-  for (let d = 0; d < 3; d++) {
-    const u = (d + 1) % 3;
-    const v = (d + 2) % 3;
-
-    // q is the neighbor offset along d
-    const q = [0, 0, 0] as [number, number, number];
-    q[d] = 1;
-
-    // Mask is a 2D grid of size dims[u] * dims[v]
-    // Each cell either null or { color, sign }
-    type MaskCell = { color: string; sign: 1 | -1 } | null;
-    const mask: MaskCell[] = new Array(dims[u] * dims[v]).fill(null);
-
-    // We sweep slices along d from -1 to dims[d]-1 in "voxel index space"
-    // Using w in [0..dims[d]] with an implicit boundary helps handle +/- faces.
-    for (let w = 0; w <= dims[d]; w++) {
-      // Build the mask
-      let n = 0;
-      for (let j = 0; j < dims[v]; j++) {
-        for (let i = 0; i < dims[u]; i++, n++) {
-          // Convert (i,j,w) in index space to world voxel coords
-          const coord = [0, 0, 0] as [number, number, number];
-          coord[d] = w;
-          coord[u] = i;
-          coord[v] = j;
-
-          // a at (w-1), b at (w)
-          const aCoord = [coord[0], coord[1], coord[2]] as [number, number, number];
-          aCoord[d] = w - 1;
-
-          const bCoord = coord;
-
-          const ax = minX + aCoord[0];
-          const ay = minY + aCoord[1];
-          const az = minZ + aCoord[2];
-
-          const bx = minX + bCoord[0];
-          const by = minY + bCoord[1];
-          const bz = minZ + bCoord[2];
-
-          const a = hasVoxel(ax, ay, az) ? getVoxel(ax, ay, az) : null;
-          const b = hasVoxel(bx, by, bz) ? getVoxel(bx, by, bz) : null;
-
-          // Face exists if exactly one side is filled.
-          if (a && !b) {
-            mask[n] = { color: a.color, sign: 1 }; // normal +d
-          } else if (!a && b) {
-            mask[n] = { color: b.color, sign: -1 }; // normal -d
-          } else {
-            mask[n] = null;
-          }
-        }
-      }
-
-      // Greedy merge rectangles in the mask
-      n = 0;
-      for (let j = 0; j < dims[v]; j++) {
-        for (let i = 0; i < dims[u]; ) {
-          const cell = mask[n];
-          if (!cell) {
-            i++;
-            n++;
-            continue;
-          }
-
-          const { color, sign } = cell;
-
-          // Compute width
-          let width = 1;
-          while (i + width < dims[u]) {
-            const c = mask[n + width];
-            if (!c || c.color !== color || c.sign !== sign) break;
-            width++;
-          }
-
-          // Compute height
-          let height = 1;
-          outer: while (j + height < dims[v]) {
-            for (let k = 0; k < width; k++) {
-              const c = mask[n + k + height * dims[u]];
-              if (!c || c.color !== color || c.sign !== sign) break outer;
-            }
-            height++;
-          }
-
-          // Emit quad for this rectangle
-          // We need the rectangle corners in 3D.
-          const x = [0, 0, 0] as [number, number, number];
-          x[d] = w;
-          x[u] = i;
-          x[v] = j;
-
-          const du = [0, 0, 0] as [number, number, number];
-          const dv = [0, 0, 0] as [number, number, number];
-          du[u] = width;
-          dv[v] = height;
-
-          // Convert from index-space to world-space (corner positions)
-          // Each voxel is [x, x+1] etc; these face planes are at integer coords.
-          const x0 = [minX + x[0], minY + x[1], minZ + x[2]] as [number, number, number];
-
-          const x1 = [x0[0] + du[0], x0[1] + du[1], x0[2] + du[2]] as [number, number, number];
-          const x2 = [x0[0] + dv[0], x0[1] + dv[1], x0[2] + dv[2]] as [number, number, number];
-          const x3 = [x0[0] + du[0] + dv[0], x0[1] + du[1] + dv[1], x0[2] + du[2] + dv[2]] as [
-            number,
-            number,
-            number
-          ];
-
-          // Normal
-          const nn = [0, 0, 0] as [number, number, number];
-          nn[d] = sign;
-
-          const [r, g, b_] = getColorRGB(color);
-
-          // Two triangles.
-          // Winding depends on sign so normals are correct.
-          if (sign === 1) {
-            // (x0, x1, x3) (x0, x3, x2)
-            pushTri(x0, x1, x3, nn, r, g, b_, positions, normals, colors);
-            pushTri(x0, x3, x2, nn, r, g, b_, positions, normals, colors);
-          } else {
-            // flip winding
-            // (x0, x3, x1) (x0, x2, x3)
-            pushTri(x0, x3, x1, nn, r, g, b_, positions, normals, colors);
-            pushTri(x0, x2, x3, nn, r, g, b_, positions, normals, colors);
-          }
-
-          // Clear mask
-          for (let yy = 0; yy < height; yy++) {
-            for (let xx = 0; xx < width; xx++) {
-              mask[n + xx + yy * dims[u]] = null;
-            }
-          }
-
-          // Advance
-          i += width;
-          n += width;
-        }
-      }
-    }
-  }
-
-  const geom = new THREE.BufferGeometry();
-  geom.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-  geom.setAttribute("normal", new THREE.Float32BufferAttribute(normals, 3));
-  geom.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
-  geom.computeBoundingSphere();
-  return geom;
 }
 
 function pushTri(
@@ -294,6 +94,170 @@ function pushTri(
   positions.push(a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]);
   normals.push(n[0], n[1], n[2], n[0], n[1], n[2], n[0], n[1], n[2]);
   colors.push(r, g, b_, r, g, b_, r, g, b_);
+}
+
+/**
+ * Greedy meshing for a sparse voxel map.
+ * Merges adjacent faces only if they have the same color.
+ */
+function buildGreedyGeometry(voxels: Map<string, Voxel>) {
+  const positions: number[] = [];
+  const normals: number[] = [];
+  const colors: number[] = [];
+
+  if (voxels.size === 0) {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.Float32BufferAttribute([], 3));
+    g.setAttribute("normal", new THREE.Float32BufferAttribute([], 3));
+    g.setAttribute("color", new THREE.Float32BufferAttribute([], 3));
+    return g;
+  }
+
+  // Bounds for the build volume
+  const minX = -HALF;
+  const maxX = HALF - 1;
+  const minZ = -HALF;
+  const maxZ = HALF - 1;
+  const minY = 0;
+  const maxY = BUILD_HEIGHT - 1;
+
+  const dims = [
+    maxX - minX + 1, // X count
+    maxY - minY + 1, // Y count
+    maxZ - minZ + 1, // Z count
+  ] as const;
+
+  const hasVoxel = (x: number, y: number, z: number) => voxels.has(keyOf(x, y, z));
+  const getVoxel = (x: number, y: number, z: number) => voxels.get(keyOf(x, y, z));
+
+  const colorCache = new Map<string, [number, number, number]>();
+  const getColorRGB = (hex: string): [number, number, number] => {
+    const cached = colorCache.get(hex);
+    if (cached) return cached;
+    const c = new THREE.Color(hex);
+    const rgb: [number, number, number] = [c.r, c.g, c.b];
+    colorCache.set(hex, rgb);
+    return rgb;
+  };
+
+  for (let d = 0; d < 3; d++) {
+    const u = (d + 1) % 3;
+    const v = (d + 2) % 3;
+
+    type MaskCell = { color: string; sign: 1 | -1 } | null;
+    const mask: MaskCell[] = new Array(dims[u] * dims[v]).fill(null);
+
+    for (let w = 0; w <= dims[d]; w++) {
+      // Build mask
+      let n = 0;
+      for (let j = 0; j < dims[v]; j++) {
+        for (let i = 0; i < dims[u]; i++, n++) {
+          const coord = [0, 0, 0] as [number, number, number];
+          coord[d] = w;
+          coord[u] = i;
+          coord[v] = j;
+
+          const aCoord = [coord[0], coord[1], coord[2]] as [number, number, number];
+          aCoord[d] = w - 1;
+          const bCoord = coord;
+
+          const ax = minX + aCoord[0];
+          const ay = minY + aCoord[1];
+          const az = minZ + aCoord[2];
+
+          const bx = minX + bCoord[0];
+          const by = minY + bCoord[1];
+          const bz = minZ + bCoord[2];
+
+          const a = hasVoxel(ax, ay, az) ? getVoxel(ax, ay, az) : null;
+          const b = hasVoxel(bx, by, bz) ? getVoxel(bx, by, bz) : null;
+
+          if (a && !b) mask[n] = { color: a.color, sign: 1 };
+          else if (!a && b) mask[n] = { color: b.color, sign: -1 };
+          else mask[n] = null;
+        }
+      }
+
+      // Greedy merge
+      n = 0;
+      for (let j = 0; j < dims[v]; j++) {
+        for (let i = 0; i < dims[u]; ) {
+          const cell = mask[n];
+          if (!cell) {
+            i++;
+            n++;
+            continue;
+          }
+
+          const { color, sign } = cell;
+
+          let width = 1;
+          while (i + width < dims[u]) {
+            const c = mask[n + width];
+            if (!c || c.color !== color || c.sign !== sign) break;
+            width++;
+          }
+
+          let height = 1;
+          outer: while (j + height < dims[v]) {
+            for (let k = 0; k < width; k++) {
+              const c = mask[n + k + height * dims[u]];
+              if (!c || c.color !== color || c.sign !== sign) break outer;
+            }
+            height++;
+          }
+
+          const x = [0, 0, 0] as [number, number, number];
+          x[d] = w;
+          x[u] = i;
+          x[v] = j;
+
+          const du = [0, 0, 0] as [number, number, number];
+          const dv = [0, 0, 0] as [number, number, number];
+          du[u] = width;
+          dv[v] = height;
+
+          const x0 = [minX + x[0], minY + x[1], minZ + x[2]] as [number, number, number];
+          const x1 = [x0[0] + du[0], x0[1] + du[1], x0[2] + du[2]] as [number, number, number];
+          const x2 = [x0[0] + dv[0], x0[1] + dv[1], x0[2] + dv[2]] as [number, number, number];
+          const x3 = [
+            x0[0] + du[0] + dv[0],
+            x0[1] + du[1] + dv[1],
+            x0[2] + du[2] + dv[2],
+          ] as [number, number, number];
+
+          const nn = [0, 0, 0] as [number, number, number];
+          nn[d] = sign;
+
+          const [r, g, b_] = getColorRGB(color);
+
+          if (sign === 1) {
+            pushTri(x0, x1, x3, nn, r, g, b_, positions, normals, colors);
+            pushTri(x0, x3, x2, nn, r, g, b_, positions, normals, colors);
+          } else {
+            pushTri(x0, x3, x1, nn, r, g, b_, positions, normals, colors);
+            pushTri(x0, x2, x3, nn, r, g, b_, positions, normals, colors);
+          }
+
+          for (let yy = 0; yy < height; yy++) {
+            for (let xx = 0; xx < width; xx++) {
+              mask[n + xx + yy * dims[u]] = null;
+            }
+          }
+
+          i += width;
+          n += width;
+        }
+      }
+    }
+  }
+
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geom.setAttribute("normal", new THREE.Float32BufferAttribute(normals, 3));
+  geom.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+  geom.computeBoundingSphere();
+  return geom;
 }
 
 function SnapDriver(props: {
@@ -339,10 +303,16 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
   const snapToRef = useRef<THREE.Vector3 | null>(null);
   const snapTargetRef = useRef<THREE.Vector3>(CAM_TARGET.clone());
 
-  const inBoundsXZ = (x: number, z: number) => x >= -HALF && x < HALF && z >= -HALF && z < HALF;
+  const inBounds = (x: number, y: number, z: number) =>
+    x >= -HALF &&
+    x < HALF &&
+    z >= -HALF &&
+    z < HALF &&
+    y >= 0 &&
+    y < BUILD_HEIGHT;
 
   const placeAt = (x: number, y: number, z: number) => {
-    if (!inBoundsXZ(x, z)) return;
+    if (!inBounds(x, y, z)) return;
     const k = keyOf(x, y, z);
     setVoxels((prev) => {
       if (prev.has(k)) return prev;
@@ -362,7 +332,6 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
     });
   };
 
-  // Greedy mesh geometry (rebuild when voxels change)
   const surfaceGeom = useMemo(() => buildGreedyGeometry(voxels), [voxels]);
 
   // Build-plane intersection helper (y = activeLayer)
@@ -373,7 +342,7 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
     return ok ? hit : null;
   };
 
-  // --- Picking plane hover/click: stable layer targeting ---
+  // --- Active layer plane handlers ---
   const handlePickPlaneMove = (e: ThreeEvent<PointerEvent>) => {
     e.stopPropagation();
     const p = e.point;
@@ -381,7 +350,7 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
     const z = Math.floor(p.z);
     const y = activeLayer;
 
-    if (!inBoundsXZ(x, z)) {
+    if (!inBounds(x, y, z)) {
       setHoverCell(null);
       return;
     }
@@ -401,7 +370,51 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
     placeAt(x, activeLayer, z);
   };
 
-  // --- Surface mesh hover/click ---
+  // --- Bounds plane helpers (MagicaVoxel cage placement) ---
+  const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+
+  const cellFromBoundsPlane = (plane: BoundsPlane, p: THREE.Vector3) => {
+    const y = clamp(Math.floor(p.y), 0, BUILD_HEIGHT - 1);
+
+    if (plane === "TOP") {
+      const x = clamp(Math.floor(p.x), -HALF, HALF - 1);
+      const z = clamp(Math.floor(p.z), -HALF, HALF - 1);
+      return { x, y: BUILD_HEIGHT - 1, z };
+    }
+
+    if (plane === "+X") {
+      const z = clamp(Math.floor(p.z), -HALF, HALF - 1);
+      return { x: HALF - 1, y, z };
+    }
+    if (plane === "-X") {
+      const z = clamp(Math.floor(p.z), -HALF, HALF - 1);
+      return { x: -HALF, y, z };
+    }
+    if (plane === "+Z") {
+      const x = clamp(Math.floor(p.x), -HALF, HALF - 1);
+      return { x, y, z: HALF - 1 };
+    }
+    // "-Z"
+    const x = clamp(Math.floor(p.x), -HALF, HALF - 1);
+    return { x, y, z: -HALF };
+  };
+
+  const handleBoundsPlaneMove = (plane: BoundsPlane) => (e: ThreeEvent<PointerEvent>) => {
+    e.stopPropagation();
+    const c = cellFromBoundsPlane(plane, e.point);
+    setHoverCell((prev) => (prev && prev.x === c.x && prev.y === c.y && prev.z === c.z ? prev : c));
+  };
+
+  const handleBoundsPlaneLeave = () => setHoverCell(null);
+
+  const handleBoundsPlaneClick = (plane: BoundsPlane) => (e: ThreeEvent<MouseEvent>) => {
+    e.stopPropagation();
+    if (e.shiftKey) return;
+    const c = cellFromBoundsPlane(plane, e.point);
+    placeAt(c.x, c.y, c.z);
+  };
+
+  // --- Surface mesh hover/click (adjacent placement + delete) ---
   const handleSurfacePointerMove = (e: ThreeEvent<PointerEvent>) => {
     e.stopPropagation();
 
@@ -410,23 +423,20 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
 
     const hitVoxel = voxelFromHit(e.point, n);
     const hitKey = keyOf(hitVoxel.x, hitVoxel.y, hitVoxel.z);
-    const hitExists = voxels.has(hitKey);
-
-    if (!hitExists) return;
+    if (!voxels.has(hitKey)) return;
 
     setHoveredVoxelKey(hitKey);
 
     const allowFace = hitVoxel.y === activeLayer || e.altKey;
 
     if (!allowFace) {
-      // Keep hover stable on active layer even while hovering other-layer surfaces
       const hit = intersectBuildPlane(e.ray);
       if (!hit) return;
       const x = Math.floor(hit.x);
       const z = Math.floor(hit.z);
       const y = activeLayer;
 
-      if (!inBoundsXZ(x, z)) {
+      if (!inBounds(x, y, z)) {
         setHoverCell(null);
         return;
       }
@@ -440,7 +450,7 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
 
     const target = { x: hitVoxel.x + dx, y: hitVoxel.y + dy, z: hitVoxel.z + dz };
 
-    if (!inBoundsXZ(target.x, target.z)) {
+    if (!inBounds(target.x, target.y, target.z)) {
       setHoverCell(null);
       return;
     }
@@ -463,8 +473,7 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
 
     const hitVoxel = voxelFromHit(e.point, n);
     const hitKey = keyOf(hitVoxel.x, hitVoxel.y, hitVoxel.z);
-    const hitExists = voxels.has(hitKey);
-    if (!hitExists) return;
+    if (!voxels.has(hitKey)) return;
 
     if (e.shiftKey) {
       removeAt(hitVoxel.x, hitVoxel.y, hitVoxel.z);
@@ -485,11 +494,20 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
     const dx = Math.round(n.x);
     const dy = Math.round(n.y);
     const dz = Math.round(n.z);
+
     placeAt(hitVoxel.x + dx, hitVoxel.y + dy, hitVoxel.z + dz);
   };
 
+  // Hover preview cell validity
   const showHover =
-    hoverCell !== null && !voxels.has(keyOf(hoverCell.x, hoverCell.y, hoverCell.z));
+    hoverCell !== null &&
+    inBounds(hoverCell.x, hoverCell.y, hoverCell.z) &&
+    !voxels.has(keyOf(hoverCell.x, hoverCell.y, hoverCell.z));
+
+  const hoveredVoxel = useMemo(() => {
+    if (!hoveredVoxelKey) return null;
+    return voxels.get(hoveredVoxelKey) ?? null;
+  }, [hoveredVoxelKey, voxels]);
 
   // Snap hotkeys
   useEffect(() => {
@@ -516,12 +534,6 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
-
-  // Hovered voxel outline mesh (cheap)
-  const hoveredVoxel = useMemo(() => {
-    if (!hoveredVoxelKey) return null;
-    return voxels.get(hoveredVoxelKey) ?? null;
-  }, [hoveredVoxelKey, voxels]);
 
   return (
     <div style={{ height: "80vh", width: "100%", position: "relative" }}>
@@ -553,11 +565,15 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
       <Canvas
         shadows
         dpr={[1, 2]}
-        camera={{ position: [CAM_ISO_POS.x, CAM_ISO_POS.y, CAM_ISO_POS.z], fov: 50, near: 0.1, far: 250 }}
+        camera={{
+          position: [CAM_ISO_POS.x, CAM_ISO_POS.y, CAM_ISO_POS.z],
+          fov: 50,
+          near: 0.1,
+          far: 250,
+        }}
         onCreated={({ camera }) => camera.lookAt(CAM_TARGET)}
         gl={{ antialias: true }}
       >
-        {/* Background */}
         <color attach="background" args={["#0b0c10"]} />
 
         {/* Lighting */}
@@ -565,25 +581,17 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
         <directionalLight position={[12, 18, 10]} intensity={1.0} castShadow />
         <directionalLight position={[-10, 8, -10]} intensity={0.35} />
 
-        {/* Always-visible grids (works from below too) */}
+        {/* Always-visible floor + active layer grids */}
         <gridHelper args={[GRID_SIZE, GRID_SIZE]} position={[0, 0, 0]} />
         <gridHelper args={[GRID_SIZE, GRID_SIZE]} position={[0, activeLayer + 0.01, 0]} />
 
-        {/* Contact shadows (nice grounding) */}
-        <ContactShadows
-          position={[0, -0.001, 0]}
-          opacity={0.45}
-          scale={40}
-          blur={2.2}
-          far={30}
-        />
+        {/* Build cage */}
+        <BuildCage size={GRID_SIZE} height={BUILD_HEIGHT} />
 
-        {/* Gizmo axis widget */}
-        <GizmoHelper alignment="bottom-right" margin={[80, 80]}>
-          <GizmoViewport axisColors={["#ff3653", "#8adb00", "#2c8fff"]} labelColor="white" />
-        </GizmoHelper>
+        {/* Contact shadows */}
+        <ContactShadows position={[0, -0.001, 0]} opacity={0.45} scale={40} blur={2.2} far={30} />
 
-        {/* Invisible picking plane at activeLayer */}
+        {/* Active layer pick plane */}
         <mesh
           rotation={[-Math.PI / 2, 0, 0]}
           position={[0, activeLayer, 0]}
@@ -595,6 +603,67 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
           <meshBasicMaterial transparent opacity={0} />
         </mesh>
 
+        {/* Bounds picking planes (walls + top) */}
+        {/* TOP */}
+        <mesh
+          rotation={[-Math.PI / 2, 0, 0]}
+          position={[0, BUILD_HEIGHT + EPS_PLANE, 0]}
+          onPointerMove={handleBoundsPlaneMove("TOP")}
+          onPointerOut={handleBoundsPlaneLeave}
+          onClick={handleBoundsPlaneClick("TOP")}
+        >
+          <planeGeometry args={[GRID_SIZE, GRID_SIZE]} />
+          <meshBasicMaterial transparent opacity={0} />
+        </mesh>
+
+        {/* +X */}
+        <mesh
+          rotation={[0, Math.PI / 2, 0]}
+          position={[HALF + EPS_PLANE, BUILD_HEIGHT / 2, 0]}
+          onPointerMove={handleBoundsPlaneMove("+X")}
+          onPointerOut={handleBoundsPlaneLeave}
+          onClick={handleBoundsPlaneClick("+X")}
+        >
+          <planeGeometry args={[GRID_SIZE, BUILD_HEIGHT]} />
+          <meshBasicMaterial transparent opacity={0} />
+        </mesh>
+
+        {/* -X */}
+        <mesh
+          rotation={[0, -Math.PI / 2, 0]}
+          position={[-HALF - EPS_PLANE, BUILD_HEIGHT / 2, 0]}
+          onPointerMove={handleBoundsPlaneMove("-X")}
+          onPointerOut={handleBoundsPlaneLeave}
+          onClick={handleBoundsPlaneClick("-X")}
+        >
+          <planeGeometry args={[GRID_SIZE, BUILD_HEIGHT]} />
+          <meshBasicMaterial transparent opacity={0} />
+        </mesh>
+
+        {/* +Z */}
+        <mesh
+          rotation={[0, 0, 0]}
+          position={[0, BUILD_HEIGHT / 2, HALF + EPS_PLANE]}
+          onPointerMove={handleBoundsPlaneMove("+Z")}
+          onPointerOut={handleBoundsPlaneLeave}
+          onClick={handleBoundsPlaneClick("+Z")}
+        >
+          <planeGeometry args={[GRID_SIZE, BUILD_HEIGHT]} />
+          <meshBasicMaterial transparent opacity={0} />
+        </mesh>
+
+        {/* -Z */}
+        <mesh
+          rotation={[0, Math.PI, 0]}
+          position={[0, BUILD_HEIGHT / 2, -HALF - EPS_PLANE]}
+          onPointerMove={handleBoundsPlaneMove("-Z")}
+          onPointerOut={handleBoundsPlaneLeave}
+          onClick={handleBoundsPlaneClick("-Z")}
+        >
+          <planeGeometry args={[GRID_SIZE, BUILD_HEIGHT]} />
+          <meshBasicMaterial transparent opacity={0} />
+        </mesh>
+
         {/* Hover preview cube */}
         {showHover && hoverCell && (
           <mesh position={[hoverCell.x + 0.5, hoverCell.y + 0.5, hoverCell.z + 0.5]}>
@@ -603,7 +672,7 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
           </mesh>
         )}
 
-        {/* Greedy meshed surface */}
+        {/* Greedy meshed surface (single mesh) */}
         <mesh
           geometry={surfaceGeom}
           castShadow
@@ -624,10 +693,13 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
         )}
 
         {/* Post-processing AO */}
-        <EffectComposer enableNormalPass>
-          <SSAO samples={8} radius={0.18} intensity={10} luminanceInfluence={0.7} />
-        </EffectComposer>
+<EffectComposer enableNormalPass>
+  <SSAO samples={8} radius={0.18} intensity={10} luminanceInfluence={0.7} />
+</EffectComposer>
 
+<GizmoHelper alignment="bottom-right" margin={[80, 80]} renderPriority={2}>
+  <GizmoViewport axisColors={["#ff3653", "#8adb00", "#2c8fff"]} labelColor="white" />
+</GizmoHelper>
         {/* Controls */}
         <OrbitControls
           ref={controlsRef}
