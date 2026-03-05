@@ -25,14 +25,6 @@ export default function Home() {
           backdropFilter: "blur(10px)",
         }}
       >
-        <div style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
-          <div style={{ fontWeight: 800, letterSpacing: 0.2 }}>Voxel Tool</div>
-          <div style={{ fontSize: 12, opacity: 0.75 }}>
-            Layer: <span style={{ fontFamily: "monospace" }}>{layer}</span> · Color:{" "}
-            <span style={{ fontFamily: "monospace" }}>{color}</span>
-          </div>
-        </div>
-
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <button
             onClick={() => setHelpOpen((v) => !v)}

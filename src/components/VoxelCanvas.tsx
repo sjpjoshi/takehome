@@ -38,6 +38,10 @@ const CAM_LERP = 0.18;
 
 type BoundsPlane = "+X" | "-X" | "+Z" | "-Z" | "TOP";
 
+function clamp(v: number, lo: number, hi: number) {
+  return Math.max(lo, Math.min(hi, v));
+}
+
 function BuildCage(props: { size: number; height: number }) {
   const { size, height } = props;
   const cy = height / 2;
@@ -347,8 +351,14 @@ function SnapDriver(props: {
   return null;
 }
 
-export default function VoxelCanvas(props: { selectedColor: string; activeLayer: number }) {
-  const { selectedColor, activeLayer } = props;
+type CmdResult = { ok: true } | { ok: false; error: string };
+
+export default function VoxelCanvas(props: {
+  selectedColor: string;
+  activeLayer: number;
+  commandOpen?: boolean;
+}) {
+  const { selectedColor, activeLayer, commandOpen = true } = props;
 
   const [voxels, setVoxels] = useState<Map<string, Voxel>>(() => new Map());
   const [hoverCell, setHoverCell] = useState<Cell>(null);
@@ -356,6 +366,10 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
 
   // Tool
   const [tool, setTool] = useState<Tool>("single");
+
+  // Command bar
+  const [cmdText, setCmdText] = useState("fill -3 0 -3 3 0 3 #222222");
+  const [cmdError, setCmdError] = useState<string | null>(null);
 
   // Camera controls
   const controlsRef = useRef<any>(null);
@@ -375,6 +389,9 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
   const strokePatchesRef = useRef<Map<string, Patch>>(new Map());
   const lastCellRef = useRef<Cell>(null);
   const lastStampRef = useRef(0);
+
+  // For paint/erase on surface: actual hit voxel cell (not adjacent placement cell)
+  const hitVoxelCellRef = useRef<Cell>(null);
 
   const inBounds = (x: number, y: number, z: number) =>
     x >= -HALF && x < HALF && z >= -HALF && z < HALF && y >= 0 && y < BUILD_HEIGHT;
@@ -503,6 +520,305 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
     });
   };
 
+  // === Command helpers (batch ops) ===
+  const setVoxelWithPatch = (
+    next: Map<string, Voxel>,
+    patches: Map<string, Patch>,
+    x: number,
+    y: number,
+    z: number,
+    color: string
+  ) => {
+    if (!inBounds(x, y, z)) return;
+    const k = keyOf(x, y, z);
+    const before = next.get(k) ?? null;
+    const after: Voxel = { x, y, z, color };
+    if (before && before.color === after.color) return;
+
+    const existingPatch = patches.get(k);
+    const originalBefore = existingPatch ? existingPatch.before : before;
+
+    next.set(k, after);
+    patches.set(k, { key: k, before: originalBefore, after });
+  };
+
+  const deleteVoxelWithPatch = (
+    next: Map<string, Voxel>,
+    patches: Map<string, Patch>,
+    x: number,
+    y: number,
+    z: number
+  ) => {
+    if (!inBounds(x, y, z)) return;
+    const k = keyOf(x, y, z);
+
+    const before = next.get(k) ?? null;
+    if (!before) return;
+
+    const existingPatch = patches.get(k);
+    const originalBefore = existingPatch ? existingPatch.before : before;
+
+    next.delete(k);
+    patches.set(k, { key: k, before: originalBefore, after: null });
+  };
+
+  const parseColorMaybe = (s: string | undefined) => {
+    if (!s) return selectedColor;
+    if (/^#([0-9a-fA-F]{6})$/.test(s)) return s.toLowerCase();
+    return null;
+  };
+
+  const toInt = (s: string) => {
+    const n = Number(s);
+    return Number.isFinite(n) ? Math.trunc(n) : null;
+  };
+  
+  type ParsedCommand =
+  | { type: "clear" }
+  | { type: "fill"; x1: number; y1: number; z1: number; x2: number; y2: number; z2: number; color: string }
+  | { type: "hollow"; x1: number; y1: number; z1: number; x2: number; y2: number; z2: number; color: string }
+  | { type: "box"; cx: number; cy: number; cz: number; size: number; color: string }
+  | { type: "stick"; x: number; y: number; z: number; len: number; axis: "x" | "y" | "z"; color: string }
+  | { type: "randomwalk"; steps: number; color: string }
+  | { type: "replace"; oldColor: string; newColor: string };
+
+  const parseCommand = (input: string): { ok: true; cmd: ParsedCommand } | { ok: false; error: string } => {
+  const t = input.trim();
+  if (!t) return { ok: true, cmd: { type: "clear" } }; // or treat empty as no-op
+
+  const parts = t.split(/\s+/);
+  const name = parts[0].toLowerCase();
+
+  const parseColor = (s: string | undefined) => {
+    if (!s) return selectedColor;
+    if (!/^#([0-9a-fA-F]{6})$/.test(s)) return null;
+    return s.toLowerCase();
+  };
+
+  const intAt = (i: number) => {
+    const n = Number(parts[i]);
+    if (!Number.isFinite(n)) return null;
+    return Math.trunc(n);
+  };
+
+  const requireInts = (start: number, count: number) => {
+    const out: number[] = [];
+    for (let i = 0; i < count; i++) {
+      const v = intAt(start + i);
+      if (v == null) return null;
+      out.push(v);
+    }
+    return out;
+  };
+
+    // clear
+    if (name === "clear") return { ok: true, cmd: { type: "clear" } };
+    // fill
+    if (name === "fill") {
+      const nums = requireInts(1, 6);
+      if (!nums) return { ok: false, error: "Usage: fill x1 y1 z1 x2 y2 z2 [#rrggbb]" };
+      const c = parseColor(parts[7]);
+      if (!c) return { ok: false, error: "Invalid color. Use #rrggbb" };
+      const [x1, y1, z1, x2, y2, z2] = nums;
+      return { ok: true, cmd: { type: "fill", x1, y1, z1, x2, y2, z2, color: c } };
+    }
+
+    if (name === "hollow") {
+      const nums = requireInts(1, 6);
+      if (!nums) return { ok: false, error: "Usage: hollow x1 y1 z1 x2 y2 z2 [#rrggbb]" };
+      const c = parseColor(parts[7]);
+      if (!c) return { ok: false, error: "Invalid color. Use #rrggbb" };
+      const [x1, y1, z1, x2, y2, z2] = nums;
+      return { ok: true, cmd: { type: "hollow", x1, y1, z1, x2, y2, z2, color: c } };
+    }
+    if (name === "box") {
+      const nums = requireInts(1, 4);
+      if (!nums) return { ok: false, error: "Usage: box cx cy cz size [#rrggbb]" };
+      const c = parseColor(parts[5]);
+      if (!c) return { ok: false, error: "Invalid color. Use #rrggbb" };
+      const [cx, cy, cz, size] = nums;
+      return { ok: true, cmd: { type: "box", cx, cy, cz, size, color: c } };
+    }
+    if (name === "stick") {
+      const nums = requireInts(1, 4);
+      if (!nums) return { ok: false, error: "Usage: stick x y z len axis(x|y|z) [#rrggbb]" };
+      const axisRaw = (parts[5] || "y").toLowerCase();
+      if (axisRaw !== "x" && axisRaw !== "y" && axisRaw !== "z")
+      return { ok: false, error: "Axis must be x, y, or z" };
+      const c = parseColor(parts[6]);
+      if (!c) return { ok: false, error: "Invalid color. Use #rrggbb" };
+      const [x, y, z, len] = nums;
+      return { ok: true, cmd: { type: "stick", x, y, z, len, axis: axisRaw, color: c } };
+    }
+
+    if (name === "randomwalk") {
+      const steps = intAt(1);
+      if (steps == null) return { ok: false, error: "Usage: randomwalk steps [#rrggbb]" };
+      const c = parseColor(parts[2]);
+      if (!c) return { ok: false, error: "Invalid color. Use #rrggbb" };
+      return { ok: true, cmd: { type: "randomwalk", steps, color: c } };
+    }
+
+    if (name === "replace") {
+      const oldC = parseColor(parts[1]);
+      const newC = parseColor(parts[2]);
+      if (!oldC || !newC) return { ok: false, error: "Usage: replace #old #new" };
+      return { ok: true, cmd: { type: "replace", oldColor: oldC, newColor: newC } };
+    }
+
+    return { ok: false, error: `Unknown command: ${name}` };
+  };
+
+const runCommandSafe = (input: string) => {
+  const parsed = parseCommand(input);
+
+  if (!parsed.ok) {
+    setCmdError(parsed.error);
+    return;
+  }
+
+  setCmdError(null);
+  const cmd = parsed.cmd;
+
+  setVoxels((prev) => {
+    const next = new Map(prev);
+    const patches = new Map<string, Patch>();
+
+    const commit = () => {
+      const list = Array.from(patches.values());
+      if (list.length) pushEntry({ kind: "batch", patches: list });
+    };
+
+    // Apply with NO THROWS
+    switch (cmd.type) {
+      case "clear": {
+        for (const v of next.values()) {
+          deleteVoxelWithPatch(next, patches, v.x, v.y, v.z);
+        }
+        commit();
+        return next;
+      }
+
+      case "fill": {
+        const xa = Math.min(cmd.x1, cmd.x2),
+          xb = Math.max(cmd.x1, cmd.x2);
+        const ya = Math.min(cmd.y1, cmd.y2),
+          yb = Math.max(cmd.y1, cmd.y2);
+        const za = Math.min(cmd.z1, cmd.z2),
+          zb = Math.max(cmd.z1, cmd.z2);
+
+        for (let y = ya; y <= yb; y++) {
+          for (let z = za; z <= zb; z++) {
+            for (let x = xa; x <= xb; x++) {
+              setVoxelWithPatch(next, patches, x, y, z, cmd.color);
+            }
+          }
+        }
+
+        commit();
+        return next;
+      }
+
+      case "hollow": {
+        const xa = Math.min(cmd.x1, cmd.x2),
+          xb = Math.max(cmd.x1, cmd.x2);
+        const ya = Math.min(cmd.y1, cmd.y2),
+          yb = Math.max(cmd.y1, cmd.y2);
+        const za = Math.min(cmd.z1, cmd.z2),
+          zb = Math.max(cmd.z1, cmd.z2);
+
+        for (let y = ya; y <= yb; y++) {
+          for (let z = za; z <= zb; z++) {
+            for (let x = xa; x <= xb; x++) {
+              const onSurface =
+                x === xa || x === xb || y === ya || y === yb || z === za || z === zb;
+              if (onSurface) setVoxelWithPatch(next, patches, x, y, z, cmd.color);
+            }
+          }
+        }
+
+        commit();
+        return next;
+      }
+
+      case "box": {
+        const r = Math.max(0, Math.floor(cmd.size / 2));
+        for (let y = cmd.cy - r; y <= cmd.cy + r; y++) {
+          for (let z = cmd.cz - r; z <= cmd.cz + r; z++) {
+            for (let x = cmd.cx - r; x <= cmd.cx + r; x++) {
+              setVoxelWithPatch(next, patches, x, y, z, cmd.color);
+            }
+          }
+        }
+        commit();
+        return next;
+      }
+
+      case "stick": {
+        const L = clamp(Math.abs(cmd.len), 1, 5000);
+        for (let i = 0; i < L; i++) {
+          const dx = cmd.axis === "x" ? i : 0;
+          const dy = cmd.axis === "y" ? i : 0;
+          const dz = cmd.axis === "z" ? i : 0;
+          setVoxelWithPatch(next, patches, cmd.x + dx, cmd.y + dy, cmd.z + dz, cmd.color);
+        }
+        commit();
+        return next;
+      }
+
+      case "randomwalk": {
+        let x = 0,
+          y = activeLayer,
+          z = 0;
+
+        setVoxelWithPatch(next, patches, x, y, z, cmd.color);
+
+        const dirs = [
+          [1, 0, 0],
+          [-1, 0, 0],
+          [0, 1, 0],
+          [0, -1, 0],
+          [0, 0, 1],
+          [0, 0, -1],
+        ] as const;
+
+        const S = clamp(cmd.steps, 1, 5000);
+        for (let i = 0; i < S; i++) {
+          const d = dirs[(Math.random() * dirs.length) | 0];
+          x += d[0];
+          y += d[1];
+          z += d[2];
+
+          x = clamp(x, -HALF, HALF - 1);
+          z = clamp(z, -HALF, HALF - 1);
+          y = clamp(y, 0, BUILD_HEIGHT - 1);
+
+          setVoxelWithPatch(next, patches, x, y, z, cmd.color);
+        }
+
+        commit();
+        return next;
+      }
+
+      case "replace": {
+        for (const v of next.values()) {
+          if (v.color.toLowerCase() === cmd.oldColor) {
+            setVoxelWithPatch(next, patches, v.x, v.y, v.z, cmd.newColor);
+          }
+        }
+        commit();
+        return next;
+      }
+
+      default: {
+        // TypeScript should make this unreachable, but this is a safe runtime fallback.
+        setCmdError("Unknown command");
+        return prev;
+      }
+    }
+  });
+};
+
   const surfaceGeom = useMemo(() => buildGreedyGeometry(voxels), [voxels]);
 
   // Build-plane intersection helper (y = activeLayer)
@@ -532,41 +848,35 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
       return;
     }
 
-const manhattanJump =
-    Math.abs(c.x - last.x) + Math.abs(c.y - last.y) + Math.abs(c.z - last.z);
-
-  // If hover jumped a lot (camera seam / ray jump), DON'T fill a huge line.
-  if (manhattanJump > 6) {
-    applyToolAt(c);
-    lastCellRef.current = c;
-    return;
-  }
+    const manhattanJump = Math.abs(c.x - last.x) + Math.abs(c.y - last.y) + Math.abs(c.z - last.z);
+    if (manhattanJump > 6) {
+      applyToolAt(c);
+      lastCellRef.current = c;
+      return;
+    }
 
     const pts = rasterLine(last, c);
     for (const p of pts) applyToolAt(p);
     lastCellRef.current = c;
   };
 
-const onPointerDownDraw = (e: ThreeEvent<PointerEvent>) => {
-  if (tool === "single") return;
-  e.stopPropagation();
+  const onPointerDownDraw = (e: ThreeEvent<PointerEvent>) => {
+    if (tool === "single") return;
+    e.stopPropagation();
 
-  // pointer capture helps keep dragging reliable
-  (e.target as any)?.setPointerCapture?.((e as any).pointerId);
+    (e.target as any)?.setPointerCapture?.((e as any).pointerId);
 
-  drawingRef.current = true;
-  beginStroke();
+    drawingRef.current = true;
+    beginStroke();
 
-  const startCell =
-    tool === "paint" || tool === "erase"
-      ? (hitVoxelCellRef.current ?? hoverCell)
-      : hoverCell;
+    const startCell =
+      tool === "paint" || tool === "erase" ? hitVoxelCellRef.current ?? hoverCell : hoverCell;
 
-  if (startCell) {
-    applyToolAt(startCell);
-    lastCellRef.current = startCell;
-  }
-};
+    if (startCell) {
+      applyToolAt(startCell);
+      lastCellRef.current = startCell;
+    }
+  };
 
   const onPointerUpDraw = () => {
     if (!drawingRef.current) return;
@@ -575,7 +885,6 @@ const onPointerDownDraw = (e: ThreeEvent<PointerEvent>) => {
     commitStroke();
   };
 
-  // Ensure we commit even if mouse is released outside the canvas
   useEffect(() => {
     const up = () => onPointerUpDraw();
     window.addEventListener("pointerup", up);
@@ -594,7 +903,6 @@ const onPointerDownDraw = (e: ThreeEvent<PointerEvent>) => {
       setHoverAndMaybeDraw(null);
       return;
     }
-
     setHoverAndMaybeDraw({ x, y, z });
   };
 
@@ -602,11 +910,9 @@ const onPointerDownDraw = (e: ThreeEvent<PointerEvent>) => {
 
   const handlePickPlaneClick = (e: ThreeEvent<MouseEvent>) => {
     e.stopPropagation();
-
-    // If in drag tools, click is handled by pointer down (stroke). Ignore click.
     if (tool !== "single") return;
-
     if (e.shiftKey) return;
+
     const p = e.point;
     const x = Math.floor(p.x);
     const z = Math.floor(p.z);
@@ -614,8 +920,6 @@ const onPointerDownDraw = (e: ThreeEvent<PointerEvent>) => {
   };
 
   // --- Bounds plane helpers (MagicaVoxel cage placement) ---
-  const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
-
   const cellFromBoundsPlane = (plane: BoundsPlane, p: THREE.Vector3) => {
     const y = clamp(Math.floor(p.y), 0, BUILD_HEIGHT - 1);
 
@@ -651,79 +955,73 @@ const onPointerDownDraw = (e: ThreeEvent<PointerEvent>) => {
 
   const handleBoundsPlaneClick = (plane: BoundsPlane) => (e: ThreeEvent<MouseEvent>) => {
     e.stopPropagation();
-
     if (tool !== "single") return;
-
     if (e.shiftKey) return;
+
     const c = cellFromBoundsPlane(plane, e.point);
     placeAtSingle(c.x, c.y, c.z);
   };
-
-  const hitVoxelCellRef = useRef<Cell>(null);
 
   // --- Surface mesh hover/click (adjacent placement + delete) ---
   const handleSurfacePointerMove = (e: ThreeEvent<PointerEvent>) => {
     e.stopPropagation();
 
-  const n = e.face?.normal;
-  if (!n) return;
+    const n = e.face?.normal;
+    if (!n) return;
 
-  const hitVoxel = voxelFromHit(e.point, n);
-  const hitKey = keyOf(hitVoxel.x, hitVoxel.y, hitVoxel.z);
-  if (!voxels.has(hitKey)) return;
+    const hitVoxel = voxelFromHit(e.point, n);
+    const hitKey = keyOf(hitVoxel.x, hitVoxel.y, hitVoxel.z);
+    if (!voxels.has(hitKey)) return;
 
-  setHoveredVoxelKey(hitKey);
-  hitVoxelCellRef.current = hitVoxel; // <-- important
+    setHoveredVoxelKey(hitKey);
+    hitVoxelCellRef.current = hitVoxel;
 
-  const allowFace = hitVoxel.y === activeLayer || e.altKey;
+    const allowFace = hitVoxel.y === activeLayer || e.altKey;
 
-  // If tool is paint/erase, we want to target the HIT voxel itself
-  if (tool === "paint" || tool === "erase") {
-    setHoverAndMaybeDraw(hitVoxel);
-    return;
-  }
+    // paint/erase should target the hit voxel cell
+    if (tool === "paint" || tool === "erase") {
+      setHoverAndMaybeDraw(hitVoxel);
+      return;
+    }
 
-  // Otherwise (single/draw), we want to target the adjacent placement cell
-  if (!allowFace) {
-    const hit = intersectBuildPlane(e.ray);
-    if (!hit) return;
+    // draw/single target the adjacent placement cell
+    if (!allowFace) {
+      const hit = intersectBuildPlane(e.ray);
+      if (!hit) return;
+      const x = Math.floor(hit.x);
+      const z = Math.floor(hit.z);
+      const y = activeLayer;
 
-    const x = Math.floor(hit.x);
-    const z = Math.floor(hit.z);
-    const y = activeLayer;
+      if (!inBounds(x, y, z)) {
+        setHoverAndMaybeDraw(null);
+        return;
+      }
+      setHoverAndMaybeDraw({ x, y, z });
+      return;
+    }
 
-    if (!inBounds(x, y, z)) {
+    const dx = Math.round(n.x);
+    const dy = Math.round(n.y);
+    const dz = Math.round(n.z);
+
+    const target = { x: hitVoxel.x + dx, y: hitVoxel.y + dy, z: hitVoxel.z + dz };
+
+    if (!inBounds(target.x, target.y, target.z)) {
       setHoverAndMaybeDraw(null);
       return;
     }
 
-    setHoverAndMaybeDraw({ x, y, z });
-    return;
-  }
+    setHoverAndMaybeDraw(target);
+  };
 
-  const dx = Math.round(n.x);
-  const dy = Math.round(n.y);
-  const dz = Math.round(n.z);
-
-  const target = { x: hitVoxel.x + dx, y: hitVoxel.y + dy, z: hitVoxel.z + dz };
-
-  if (!inBounds(target.x, target.y, target.z)) {
-    setHoverAndMaybeDraw(null);
-    return;
-  }
-
-  setHoverAndMaybeDraw(target);
-};
-
-const handleSurfacePointerOut = (e: ThreeEvent<PointerEvent>) => {
-  e.stopPropagation();
-  setHoveredVoxelKey(null);
-  hitVoxelCellRef.current = null;
-};
+  const handleSurfacePointerOut = (e: ThreeEvent<PointerEvent>) => {
+    e.stopPropagation();
+    setHoveredVoxelKey(null);
+    hitVoxelCellRef.current = null;
+  };
 
   const handleSurfaceClick = (e: ThreeEvent<MouseEvent>) => {
     e.stopPropagation();
-
     if (tool !== "single") return;
 
     const n = e.face?.normal;
@@ -738,7 +1036,7 @@ const handleSurfacePointerOut = (e: ThreeEvent<PointerEvent>) => {
       return;
     }
 
-    const allowFace = hitVoxel.y === activeLayer || (e as any).altKey;
+    const allowFace = hitVoxel.y === activeLayer || e.altKey;
 
     if (!allowFace) {
       const hit = intersectBuildPlane(e.ray);
@@ -756,18 +1054,17 @@ const handleSurfacePointerOut = (e: ThreeEvent<PointerEvent>) => {
     placeAtSingle(hitVoxel.x + dx, hitVoxel.y + dy, hitVoxel.z + dz);
   };
 
-  // Hover preview cell validity
-const showHover = useMemo(() => {
-  if (!hoverCell) return false;
-  if (!inBounds(hoverCell.x, hoverCell.y, hoverCell.z)) return false;
+  const showHover = useMemo(() => {
+    if (!hoverCell) return false;
+    if (!inBounds(hoverCell.x, hoverCell.y, hoverCell.z)) return false;
 
-  const occupied = voxels.has(keyOf(hoverCell.x, hoverCell.y, hoverCell.z));
+    const occupied = voxels.has(keyOf(hoverCell.x, hoverCell.y, hoverCell.z));
 
-  if (tool === "draw") return !occupied;      // show where you'd place
-  if (tool === "paint") return occupied;      // show only on existing
-  if (tool === "erase") return occupied;      // show only on existing
-  return !occupied;                           // single: place preview
-}, [hoverCell, voxels, tool]);
+    if (tool === "draw") return !occupied;
+    if (tool === "paint") return occupied;
+    if (tool === "erase") return occupied;
+    return !occupied;
+  }, [hoverCell, voxels, tool]);
 
   const hoveredVoxel = useMemo(() => {
     if (!hoveredVoxelKey) return null;
@@ -847,7 +1144,7 @@ const showHover = useMemo(() => {
           backdropFilter: "blur(10px)",
           pointerEvents: "auto",
           lineHeight: 1.35,
-          width: 330,
+          width: 340,
           maxWidth: "calc(100vw - 24px)",
         }}
       >
@@ -927,6 +1224,87 @@ const showHover = useMemo(() => {
         </div>
       </div>
 
+      {/* Command bar */}
+      {commandOpen && (
+        <div
+          style={{
+            position: "absolute",
+            left: 12,
+            bottom: 12,
+            zIndex: 60,
+            width: 560,
+            maxWidth: "calc(100vw - 24px)",
+            padding: 10,
+            borderRadius: 12,
+            background: "rgba(15, 15, 18, 0.85)",
+            border: "1px solid rgba(255,255,255,0.12)",
+            color: "white",
+            boxShadow: "0 10px 30px rgba(0,0,0,0.35)",
+            backdropFilter: "blur(10px)",
+            pointerEvents: "auto",
+          }}
+        >
+          <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>
+            Commands:{" "}
+            <span style={{ fontFamily: "monospace" }}>
+              fill / hollow / box / stick / randomwalk / replace / clear
+            </span>
+          </div>
+
+          <div style={{ display: "flex", gap: 8 }}>
+            <input
+              value={cmdText}
+              onChange={(e) => setCmdText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  const r = runCommandSafe(cmdText);
+                
+                }
+              }}
+              placeholder="e.g. fill -3 0 -3 3 0 3 #54a0ff"
+              style={{
+                flex: 1,
+                padding: "10px 12px",
+                borderRadius: 10,
+                border: "1px solid rgba(255,255,255,0.16)",
+                background: "rgba(0,0,0,0.35)",
+                color: "white",
+                outline: "none",
+                fontFamily:
+                  "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
+                fontSize: 12,
+              }}
+            />
+            <button
+              onClick={() => runCommandSafe(cmdText)}
+              style={{
+                padding: "10px 12px",
+                borderRadius: 10,
+                border: "1px solid rgba(255,255,255,0.16)",
+                background: "rgba(255,255,255,0.08)",
+                color: "white",
+                cursor: "pointer",
+                fontSize: 12,
+              }}
+            >
+              Run
+            </button>
+          </div>
+
+          {cmdError && (
+            <div style={{ marginTop: 8, fontSize: 12, color: "#ff6b6b" }}>{cmdError}</div>
+          )}
+
+          <div style={{ marginTop: 8, fontSize: 11, opacity: 0.7, lineHeight: 1.4 }}>
+            Examples:{" "}
+            <span style={{ fontFamily: "monospace" }}>
+              fill -9 0 -9 9 0 9 #222222 · hollow -6 0 -6 6 6 6 #ffffff · box 0 4 0 5 · stick 0 0
+              0 10 y · randomwalk 800 #1dd1a1 · replace #222222 #54a0ff · clear
+            </span>
+          </div>
+        </div>
+      )}
+
       <Canvas
         shadows
         dpr={[1, 2]}
@@ -970,7 +1348,6 @@ const showHover = useMemo(() => {
         </mesh>
 
         {/* Bounds picking planes (walls + top) */}
-        {/* TOP */}
         <mesh
           rotation={[-Math.PI / 2, 0, 0]}
           position={[0, BUILD_HEIGHT + EPS_PLANE, 0]}
@@ -983,7 +1360,6 @@ const showHover = useMemo(() => {
           <meshBasicMaterial transparent opacity={0} />
         </mesh>
 
-        {/* +X */}
         <mesh
           rotation={[0, Math.PI / 2, 0]}
           position={[HALF + EPS_PLANE, BUILD_HEIGHT / 2, 0]}
@@ -996,7 +1372,6 @@ const showHover = useMemo(() => {
           <meshBasicMaterial transparent opacity={0} />
         </mesh>
 
-        {/* -X */}
         <mesh
           rotation={[0, -Math.PI / 2, 0]}
           position={[-HALF - EPS_PLANE, BUILD_HEIGHT / 2, 0]}
@@ -1009,7 +1384,6 @@ const showHover = useMemo(() => {
           <meshBasicMaterial transparent opacity={0} />
         </mesh>
 
-        {/* +Z */}
         <mesh
           rotation={[0, 0, 0]}
           position={[0, BUILD_HEIGHT / 2, HALF + EPS_PLANE]}
@@ -1022,7 +1396,6 @@ const showHover = useMemo(() => {
           <meshBasicMaterial transparent opacity={0} />
         </mesh>
 
-        {/* -Z */}
         <mesh
           rotation={[0, Math.PI, 0]}
           position={[0, BUILD_HEIGHT / 2, -HALF - EPS_PLANE]}
@@ -1064,7 +1437,7 @@ const showHover = useMemo(() => {
           <SSAO samples={8} radius={0.18} intensity={10} luminanceInfluence={0.7} />
         </EffectComposer>
 
-        {/* Gizmo axis widget (rendered after postprocessing) */}
+        {/* Gizmo axis widget */}
         <GizmoHelper alignment="bottom-right" margin={[80, 80]} renderPriority={2}>
           <GizmoViewport axisColors={["#ff3653", "#8adb00", "#2c8fff"]} labelColor="white" />
         </GizmoHelper>
