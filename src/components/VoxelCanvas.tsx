@@ -8,9 +8,10 @@ import {
   Edges,
   GizmoHelper,
   GizmoViewport,
+  ContactShadows
 } from "@react-three/drei";
 import { useEffect, useMemo, useRef, useState } from "react";
-
+import { EffectComposer, SSAO } from "@react-three/postprocessing";
 type Voxel = { x: number; y: number; z: number; color: string };
 type Cell = { x: number; y: number; z: number } | null;
 
@@ -251,13 +252,41 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
           camera.lookAt(CAM_TARGET);
         }}
       >
-        {/* Lights */}
-        <ambientLight intensity={0.65} />
-        <directionalLight position={[12, 18, 10]} intensity={1} />
-        <directionalLight position={[-8, 10, -10]} intensity={0.4} />
+<ambientLight intensity={0.35} />
 
-{/* Ground grid (top) */}
-<Grid infiniteGrid={false} args={[GRID_SIZE, GRID_SIZE]} position={[0, 0, 0]} />
+<directionalLight
+  position={[10, 15, 10]}
+  intensity={0.9}
+  castShadow
+/>
+
+<directionalLight
+  position={[-10, 8, -10]}
+  intensity={0.35}
+/>
+
+<gridHelper args={[GRID_SIZE, GRID_SIZE]} position={[0, 0, 0]} />
+<gridHelper args={[GRID_SIZE, GRID_SIZE]} position={[0, activeLayer + 0.01, 0]} />
+
+<ContactShadows
+  position={[0, -0.001, 0]}
+  opacity={0.4}
+  scale={40}
+  blur={2}
+/>
+
+<EffectComposer enableNormalPass>
+  <SSAO
+    samples={8}
+    radius={0.18}
+    intensity={10}
+  />
+</EffectComposer>
+
+<OrbitControls makeDefault />
+
+      {/* Ground grid (top) */}
+    <Grid infiniteGrid={false} args={[GRID_SIZE, GRID_SIZE]} position={[0, 0, 0]} />
 
 {/* Ground grid (underside mirror) */}
 <Grid
