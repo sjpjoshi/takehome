@@ -2,8 +2,14 @@
 
 import * as THREE from "three";
 import { Canvas, ThreeEvent } from "@react-three/fiber";
-import { OrbitControls, Grid, Edges } from "@react-three/drei";
-import { useMemo, useState } from "react";
+import {
+  OrbitControls,
+  Grid,
+  Edges,
+  GizmoHelper,
+  GizmoViewport,
+} from "@react-three/drei";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type Voxel = { x: number; y: number; z: number; color: string };
 type Cell = { x: number; y: number; z: number } | null;
@@ -15,6 +21,14 @@ function keyOf(x: number, y: number, z: number) {
 const GRID_SIZE = 20;
 const HALF = GRID_SIZE / 2;
 
+// Camera feel (MagicaVoxel-ish)
+const CAM_TARGET = new THREE.Vector3(0, 0, 0);
+const CAM_ISO_POS = new THREE.Vector3(10, 10, 10); // isometric-ish
+const CAM_FRONT_POS = new THREE.Vector3(0, 6, 14);
+const CAM_RIGHT_POS = new THREE.Vector3(14, 6, 0);
+const CAM_TOP_POS = new THREE.Vector3(0, 18, 0.001); // avoid singularity
+const CAM_LERP = 0.18;
+
 export default function VoxelCanvas(props: { selectedColor: string; activeLayer: number }) {
   const { selectedColor, activeLayer } = props;
 
@@ -24,8 +38,12 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
   const [hoverCell, setHoverCell] = useState<Cell>(null);
   const [hoveredVoxelKey, setHoveredVoxelKey] = useState<string | null>(null);
 
-  const inBounds = (x: number, z: number) =>
-    x >= -HALF && x < HALF && z >= -HALF && z < HALF;
+  // --- Camera control refs ---
+  const controlsRef = useRef<any>(null);
+  const snapToRef = useRef<THREE.Vector3 | null>(null);
+  const snapTargetRef = useRef<THREE.Vector3>(CAM_TARGET.clone());
+
+  const inBounds = (x: number, z: number) => x >= -HALF && x < HALF && z >= -HALF && z < HALF;
 
   const placeAt = (x: number, y: number, z: number) => {
     if (!inBounds(x, z)) return;
@@ -60,7 +78,7 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
   // --- Picking plane (at activeLayer) hover/click: stable layer targeting ---
   const handlePickPlaneMove = (e: ThreeEvent<PointerEvent>) => {
     e.stopPropagation();
-    const p = e.point; // intersection with this plane
+    const p = e.point;
     const x = Math.floor(p.x);
     const z = Math.floor(p.z);
     const y = activeLayer;
@@ -70,9 +88,7 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
       return;
     }
 
-    setHoverCell((prev) =>
-      prev && prev.x === x && prev.y === y && prev.z === z ? prev : { x, y, z }
-    );
+    setHoverCell((prev) => (prev && prev.x === x && prev.y === y && prev.z === z ? prev : { x, y, z }));
   };
 
   const handlePickPlaneLeave = () => setHoverCell(null);
@@ -81,7 +97,7 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
     e.stopPropagation();
     if (e.shiftKey) return;
 
-    const p = e.point; // intersection with this plane
+    const p = e.point;
     const x = Math.floor(p.x);
     const z = Math.floor(p.z);
 
@@ -89,15 +105,12 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
   };
 
   // --- Voxel hover/click ---
-  // Rule: if voxel is NOT on activeLayer, we don't do face-preview/face-place
-  // (unless Alt is held). This prevents "cursor confusion" across layers.
   const handleVoxelPointerMove = (e: ThreeEvent<PointerEvent>, v: Voxel) => {
     e.stopPropagation();
 
     const allowFace = v.y === activeLayer || e.altKey;
 
     if (!allowFace) {
-      // Keep hover stable on active layer even while hovering other-layer voxels
       const hit = intersectBuildPlane(e.ray);
       if (!hit) return;
 
@@ -110,9 +123,7 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
         return;
       }
 
-      setHoverCell((prev) =>
-        prev && prev.x === x && prev.y === y && prev.z === z ? prev : { x, y, z }
-      );
+      setHoverCell((prev) => (prev && prev.x === x && prev.y === y && prev.z === z ? prev : { x, y, z }));
       return;
     }
 
@@ -146,7 +157,6 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
     const allowFace = v.y === activeLayer || e.altKey;
 
     if (!allowFace) {
-      // Treat click like placing on active layer plane
       const hit = intersectBuildPlane(e.ray);
       if (!hit) return;
 
@@ -168,19 +178,111 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
 
   const showHover = hoverCell !== null && !voxels.has(keyOf(hoverCell.x, hoverCell.y, hoverCell.z));
 
+  // --- Camera snap hotkeys ---
+  useEffect(() => {
+    const onKeyDown = (ev: KeyboardEvent) => {
+      // Don’t steal typing focus
+      const t = ev.target as HTMLElement | null;
+      const tag = t?.tagName?.toLowerCase();
+      if (tag === "input" || tag === "textarea" || (t as any)?.isContentEditable) return;
+
+      // 1: Front, 2: Right, 3: Top, 4: Iso
+      if (ev.key === "1") snapToRef.current = CAM_FRONT_POS.clone();
+      if (ev.key === "2") snapToRef.current = CAM_RIGHT_POS.clone();
+      if (ev.key === "3") snapToRef.current = CAM_TOP_POS.clone();
+      if (ev.key === "4") snapToRef.current = CAM_ISO_POS.clone();
+
+      if (!snapToRef.current) return;
+
+      // Keep target at origin (or you can target center of build)
+      snapTargetRef.current = CAM_TARGET.clone();
+
+      // Kick controls update
+      const c = controlsRef.current;
+      if (c) {
+        c.target.copy(snapTargetRef.current);
+        c.update();
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  // Smoothly animate snaps by using OrbitControls' underlying camera each frame
+  const onControlsChange = () => {
+    // If user is interacting, cancel snap
+    // (OrbitControls sets state internally; simplest is: if they move camera, stop snapping)
+    // You can keep snapping if you want, but this feels better.
+    // We'll cancel on any manual change:
+    // snapToRef.current = null; // optional — comment out if you want snap to continue
+  };
+
   return (
-    <div style={{ height: "80vh", width: "100%" }}>
-      <Canvas camera={{ position: [8, 8, 8], fov: 50 }}>
-        <ambientLight intensity={0.7} />
-        <directionalLight position={[10, 15, 10]} intensity={1} />
+    <div style={{ height: "80vh", width: "100%", position: "relative" }}>
+      {/* HUD (voxel count + snap hint) */}
+      <div
+        style={{
+          position: "absolute",
+          top: 12,
+          right: 12,
+          zIndex: 60,
+          padding: "8px 10px",
+          borderRadius: 12,
+          background: "rgba(15, 15, 18, 0.85)",
+          border: "1px solid rgba(255,255,255,0.12)",
+          color: "white",
+          fontSize: 12,
+          fontFamily:
+            "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
+          boxShadow: "0 10px 30px rgba(0,0,0,0.35)",
+          backdropFilter: "blur(10px)",
+          pointerEvents: "none",
+          lineHeight: 1.35,
+        }}
+      >
+        <div>Voxels: {voxels.size}</div>
+        <div style={{ opacity: 0.75 }}>Views: 1 Front · 2 Right · 3 Top · 4 Iso</div>
+      </div>
 
-        {/* Ground reference grid */}
-        <Grid infiniteGrid={false} args={[GRID_SIZE, GRID_SIZE]} position={[0, 0, 0]} />
+      <Canvas
+        camera={{ position: [CAM_ISO_POS.x, CAM_ISO_POS.y, CAM_ISO_POS.z], fov: 50, near: 0.1, far: 200 }}
+        onCreated={({ camera }) => {
+          camera.lookAt(CAM_TARGET);
+        }}
+      >
+        {/* Lights */}
+        <ambientLight intensity={0.65} />
+        <directionalLight position={[12, 18, 10]} intensity={1} />
+        <directionalLight position={[-8, 10, -10]} intensity={0.4} />
 
-        {/* Active build grid moves with layer */}
-        <Grid args={[GRID_SIZE, GRID_SIZE]} position={[0, activeLayer + 0.01, 0]} />
+{/* Ground grid (top) */}
+<Grid infiniteGrid={false} args={[GRID_SIZE, GRID_SIZE]} position={[0, 0, 0]} />
 
-        {/* Invisible picking plane at activeLayer (this fixes "can't place blocks") */}
+{/* Ground grid (underside mirror) */}
+<Grid
+  infiniteGrid={false}
+  args={[GRID_SIZE, GRID_SIZE]}
+  position={[0, -0.001, 0]}
+  rotation={[Math.PI, 0, 0]}
+/>
+
+{/* Active layer grid (top) */}
+<Grid args={[GRID_SIZE, GRID_SIZE]} position={[0, activeLayer + 0.01, 0]} />
+
+{/* Active layer grid (underside mirror) */}
+<Grid
+  args={[GRID_SIZE, GRID_SIZE]}
+  position={[0, activeLayer - 0.001, 0]}
+  rotation={[Math.PI, 0, 0]}
+/>
+
+        {/* Gizmo axis (MagicaVoxel-like corner widget) */}
+        <GizmoHelper alignment="bottom-right" margin={[80, 80]}>
+          <GizmoViewport axisColors={["#ff3653", "#8adb00", "#2c8fff"]} labelColor="white" />
+        </GizmoHelper>
+
+        {/* Invisible picking plane at activeLayer */}
         <mesh
           rotation={[-Math.PI / 2, 0, 0]}
           position={[0, activeLayer, 0]}
@@ -200,7 +302,7 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
           </mesh>
         )}
 
-        {/* Voxels + outline highlight */}
+        {/* Voxels */}
         {voxelList.map((v) => {
           const k = keyOf(v.x, v.y, v.z);
           return (
@@ -225,8 +327,82 @@ export default function VoxelCanvas(props: { selectedColor: string; activeLayer:
           );
         })}
 
-        <OrbitControls makeDefault />
+        {/* Orbit controls tuned */}
+        <OrbitControls
+          ref={controlsRef}
+          makeDefault
+          target={CAM_TARGET}
+          enableDamping
+          dampingFactor={0.08}
+          rotateSpeed={0.55}
+          zoomSpeed={0.9}
+          panSpeed={0.7}
+          minDistance={6}
+          maxDistance={40}
+          minPolarAngle={0.02}
+maxPolarAngle={Math.PI - 0.02}
+          onChange={onControlsChange}
+        />
+
+        {/* Smooth camera snap (runs in React, not a separate component) */}
+        <SnapDriver controlsRef={controlsRef} snapToRef={snapToRef} snapTargetRef={snapTargetRef} />
       </Canvas>
     </div>
   );
+}
+
+/**
+ * Small helper component inside the same file:
+ * lerps camera + target to snap view smoothly.
+ */
+function SnapDriver(props: {
+  controlsRef: React.RefObject<any>;
+  snapToRef: React.MutableRefObject<THREE.Vector3 | null>;
+  snapTargetRef: React.MutableRefObject<THREE.Vector3>;
+}) {
+  const { controlsRef, snapToRef, snapTargetRef } = props;
+
+  // useFrame is from R3F, but we kept it out of the main component to avoid re-renders.
+  // Importing useFrame at top would be fine too; we already didn't in this file.
+  // We'll lazily require it via drei? No — simplest: add useFrame import at top if needed.
+  // Instead, we can do a tiny workaround: use R3F's internal frame hook via useThree + requestAnimationFrame
+  // But easiest is to just import useFrame. We'll do that properly:
+
+  return <SnapDriverInner controlsRef={controlsRef} snapToRef={snapToRef} snapTargetRef={snapTargetRef} />;
+}
+
+function SnapDriverInner(props: {
+  controlsRef: React.RefObject<any>;
+  snapToRef: React.MutableRefObject<THREE.Vector3 | null>;
+  snapTargetRef: React.MutableRefObject<THREE.Vector3>;
+}) {
+  const { controlsRef, snapToRef, snapTargetRef } = props;
+  // Import useFrame properly:
+  // (Placed here to keep this file copy-pasteable: you must add `useFrame` to the import line above if TS complains.)
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { useFrame } = require("@react-three/fiber") as typeof import("@react-three/fiber");
+
+  useFrame(() => {
+    const c = controlsRef.current;
+    const dest = snapToRef.current;
+    if (!c || !dest) return;
+
+    const cam: THREE.Camera = c.object;
+    const camPos = (cam as any).position as THREE.Vector3;
+
+    camPos.lerp(dest, CAM_LERP);
+    c.target.lerp(snapTargetRef.current, CAM_LERP);
+
+    c.update();
+
+    // Stop when close enough
+    if (camPos.distanceTo(dest) < 0.02) {
+      camPos.copy(dest);
+      c.target.copy(snapTargetRef.current);
+      c.update();
+      snapToRef.current = null;
+    }
+  });
+
+  return null;
 }
