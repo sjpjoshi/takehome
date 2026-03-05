@@ -380,6 +380,7 @@ export default function VoxelCanvas(props: {
   const undoRef = useRef<HistoryEntry[]>([]);
   const redoRef = useRef<HistoryEntry[]>([]);
   const [, bumpHistoryUI] = useState(0);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const canUndo = undoRef.current.length > 0;
   const canRedo = redoRef.current.length > 0;
@@ -392,6 +393,77 @@ export default function VoxelCanvas(props: {
 
   // For paint/erase on surface: actual hit voxel cell (not adjacent placement cell)
   const hitVoxelCellRef = useRef<Cell>(null);
+
+  type SceneFileV1 = {
+  version: 1;
+  gridSize: number;
+  buildHeight: number;
+  voxels: Array<{ x: number; y: number; z: number; color: string }>;
+};
+
+  const exportSceneJSON = () => {
+    const data: SceneFileV1 = {
+      version: 1,
+      gridSize: GRID_SIZE,
+      buildHeight: BUILD_HEIGHT,
+      voxels: Array.from(voxels.values()),
+    };
+
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement("a");
+      a.href = url;
+      a.download = "voxel-scene.json";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+  };
+
+  const importSceneJSON = async (file: File) => {
+  const text = await file.text();
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    setCmdError("Invalid JSON file.");
+    return;
+  }
+
+  if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.voxels)) {
+    setCmdError("Unsupported scene format.");
+    return;
+  }
+
+  const next = new Map<string, Voxel>();
+
+  for (const v of parsed.voxels) {
+    if (
+      typeof v?.x !== "number" ||
+      typeof v?.y !== "number" ||
+      typeof v?.z !== "number" ||
+      typeof v?.color !== "string"
+    )
+      continue;
+
+    const color = v.color.toLowerCase();
+    if (!/^#([0-9a-f]{6})$/.test(color)) continue;
+    if (!inBounds(v.x, v.y, v.z)) continue;
+
+    next.set(keyOf(v.x, v.y, v.z), { x: v.x, y: v.y, z: v.z, color });
+  }
+
+  setVoxels(next);
+
+  // reset history
+  undoRef.current.length = 0;
+  redoRef.current.length = 0;
+  bumpHistoryUI((n) => n + 1);
+
+  setCmdError(null);
+  };
 
   const inBounds = (x: number, y: number, z: number) =>
     x >= -HALF && x < HALF && z >= -HALF && z < HALF && y >= 0 && y < BUILD_HEIGHT;
@@ -891,6 +963,41 @@ const runCommandSafe = (input: string) => {
     return () => window.removeEventListener("pointerup", up);
   }, []);
 
+  useEffect(() => {
+  const raw = localStorage.getItem("voxel_scene_autosave_v1");
+  if (!raw) return;
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.voxels)) return;
+
+    const next = new Map<string, Voxel>();
+    for (const v of parsed.voxels) {
+      if (typeof v?.x !== "number" || typeof v?.y !== "number" || typeof v?.z !== "number") continue;
+      if (typeof v?.color !== "string") continue;
+      const color = v.color.toLowerCase();
+      if (!/^#([0-9a-f]{6})$/.test(color)) continue;
+      if (!inBounds(v.x, v.y, v.z)) continue;
+
+      next.set(keyOf(v.x, v.y, v.z), { x: v.x, y: v.y, z: v.z, color });
+    }
+    setVoxels(next);
+  } catch {
+    // ignore autosave corruption
+  }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+  const data: SceneFileV1 = {
+    version: 1,
+    gridSize: GRID_SIZE,
+    buildHeight: BUILD_HEIGHT,
+    voxels: Array.from(voxels.values()),
+  };
+  localStorage.setItem("voxel_scene_autosave_v1", JSON.stringify(data));
+  }, [voxels]);
+
   // --- Active layer plane handlers ---
   const handlePickPlaneMove = (e: ThreeEvent<PointerEvent>) => {
     e.stopPropagation();
@@ -1148,6 +1255,49 @@ const runCommandSafe = (input: string) => {
           maxWidth: "calc(100vw - 24px)",
         }}
       >
+        <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+  <button
+    onClick={exportSceneJSON}
+    style={{
+      padding: "6px 10px",
+      borderRadius: 10,
+      border: "1px solid rgba(255,255,255,0.16)",
+      background: "rgba(255,255,255,0.08)",
+      color: "white",
+      cursor: "pointer",
+      fontSize: 12,
+    }}
+  >
+    Save (.json)
+  </button>
+
+  <button
+    onClick={() => fileInputRef.current?.click()}
+    style={{
+      padding: "6px 10px",
+      borderRadius: 10,
+      border: "1px solid rgba(255,255,255,0.16)",
+      background: "rgba(255,255,255,0.08)",
+      color: "white",
+      cursor: "pointer",
+      fontSize: 12,
+    }}
+  >
+    Load (.json)
+    </button>
+    <input
+      ref={fileInputRef}
+      type="file"
+      accept="application/json"
+      style={{ display: "none" }}
+      onChange={(e) => {
+        const f = e.target.files?.[0];
+        if (!f) return;
+        importSceneJSON(f);
+        e.currentTarget.value = ""; // allows loading same file again
+      }}
+      />
+    </div>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
           <div>
             <div>Voxels: {voxels.size}</div>
